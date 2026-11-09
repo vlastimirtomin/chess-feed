@@ -1,0 +1,112 @@
+name: Update tournaments
+
+on:
+  schedule:
+    # Six runs a day at fixed UTC times. The script decides who is due, so most runs are short.
+    # In Serbia this is 01:17, 05:17, 09:17, 13:17, 17:17, 21:17 in winter (one hour later in summer).
+    - cron: "17 0,4,8,12,16,20 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "update = normal run | discover = print the search form's fields | check-filter = test the date filter"
+        type: choice
+        options: [update, discover, check-filter]
+        default: update
+
+permissions:
+  contents: write   # only for the small keep-alive commit at the end
+  pages: write      # publish the feeds
+  id-token: write   # required by the Pages deployment
+
+concurrency:
+  group: chess-watch
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check that the secrets exist
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          if [ -z "$DATA_REPO" ] || [ -z "$DATA_REPO_TOKEN" ]; then
+            echo "::error::The secrets DATA_REPO and DATA_REPO_TOKEN must both exist in THIS repository (Settings > Secrets and variables > Actions > Repository secrets, exact names, capital letters)."
+            exit 1
+          fi
+
+      - name: Check out the private data repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ secrets.DATA_REPO }}
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+
+      - name: Work out the public address
+        run: echo "SITE_URL=https://$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]').github.io/${GITHUB_REPOSITORY#*/}/" >> "$GITHUB_ENV"
+
+      - name: Discover form fields
+        if: ${{ github.event.inputs.mode == 'discover' }}
+        run: python chess_watch.py --discover --config data/config.ini --state-dir data/state --contact "https://github.com/${{ github.repository }}"
+
+      - name: Check the date filter
+        if: ${{ github.event.inputs.mode == 'check-filter' }}
+        run: python chess_watch.py --check-filter --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
+
+      - name: Update tournaments
+        if: ${{ github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' }}
+        run: python chess_watch.py --config data/config.ini --players data/players.txt --state-dir data/state --out-dir site --site-url "$SITE_URL" --contact "https://github.com/${{ github.repository }}"
+
+      - name: Upload the feeds
+        id: upload
+        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && hashFiles('site/index.html') != '' }}
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Publish the feeds
+        id: deployment
+        if: ${{ always() && steps.upload.outcome == 'success' }}
+        uses: actions/deploy-pages@v5
+
+      - name: Notify WebSub hubs
+        if: ${{ always() && steps.deployment.outcome == 'success' }}
+        run: python chess_watch.py --websub-ping --config data/config.ini --state-dir data/state --contact "https://github.com/${{ github.repository }}"
+
+      - name: Save state and request log (private repository)
+        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' }}
+        run: |
+          cd data
+          git config user.name "chess-watch bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state
+          if ! git diff --cached --quiet; then
+            git commit -m "Update state"
+            git push
+          fi
+
+      - name: Keep scheduled runs alive
+        if: ${{ always() }}
+        run: |
+          # GitHub switches off scheduled runs of a public repo after about 60 days without activity.
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 30 * 24 * 3600 )) ]; then
+            git config user.name "chess-watch bot"
+            git config user.email "actions@users.noreply.github.com"
+            git commit --allow-empty -m "Keep scheduled runs alive"
+            git push
+          fi

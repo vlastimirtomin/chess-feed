@@ -26,6 +26,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      PYTHONUNBUFFERED: "1"   # show the script's progress lines in the log as they happen
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

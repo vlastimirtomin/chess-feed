@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "update = normal run | rebuild = regenerate the feeds from the saved state (after changing groups or titles) | discover = print the search form's fields | check-filter = test the date filter"
+        description: "update = normal run | rebuild = regenerate the feeds from the saved state (after changing groups or titles) | discover = print the search form's fields | check-filter = test the date filter | check-results = show what is read from finished tournaments"
         type: choice
-        options: [update, rebuild, discover, check-filter]
+        options: [update, rebuild, discover, check-filter, check-results]
         default: update
 
 permissions:
@@ -67,17 +67,21 @@ jobs:
         if: ${{ github.event.inputs.mode == 'check-filter' }}
         run: python chess_watch.py --check-filter --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
 
+      - name: Check the reading of results pages
+        if: ${{ github.event.inputs.mode == 'check-results' }}
+        run: python chess_watch.py --check-results --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
+
       - name: Rebuild the feeds (no player is checked)
         if: ${{ github.event.inputs.mode == 'rebuild' }}
         run: python chess_watch.py --rebuild --config data/config.ini --players data/players.txt --state-dir data/state --out-dir site --site-url "$SITE_URL" --contact "https://github.com/${{ github.repository }}"
 
       - name: Update tournaments
-        if: ${{ github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && github.event.inputs.mode != 'rebuild' }}
+        if: ${{ github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && github.event.inputs.mode != 'check-results' && github.event.inputs.mode != 'rebuild' }}
         run: python chess_watch.py --config data/config.ini --players data/players.txt --state-dir data/state --out-dir site --site-url "$SITE_URL" --contact "https://github.com/${{ github.repository }}"
 
       - name: Upload the feeds
         id: upload
-        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && hashFiles('site/index.html') != '' }}
+        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && github.event.inputs.mode != 'check-results' && hashFiles('site/index.html') != '' }}
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
@@ -92,7 +96,7 @@ jobs:
         run: python chess_watch.py --websub-ping --config data/config.ini --state-dir data/state --contact "https://github.com/${{ github.repository }}"
 
       - name: Save state and request log (private repository)
-        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' }}
+        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && github.event.inputs.mode != 'check-results' }}
         run: |
           cd data
           git config user.name "chess-watch bot"

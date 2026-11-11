@@ -57,8 +57,9 @@ DEFAULTS = {
     "requests": {"delay_seconds": "45", "jitter_seconds": "20", "max_players_per_run": "5", "max_failures": "3",
                  "use_date_filter": "yes", "date_format": "%Y-%m-%d", "newest_first_sort": "yes"},
     "window": {"finished_days": "33", "upcoming_days": "366"},
-    "feed": {"name": "rss", "title": "Турнири: нови уписи", "player_title": "Турнири: {label} - {fide}",
+    "feed": {"player_prefix": "fide", "player_title": "Турнири: {label} - {fide}",
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
+    "groups": {"default": ""},
     "websub": {"enabled": "yes", "hubs": "https://pubsubhubbub.appspot.com/, https://websubhub.com/hub",
                "wait_seconds": "90"},
     "schedule": {"timezone": "Europe/Belgrade", "active_from": "05:00", "active_until": "01:00",
@@ -88,11 +89,30 @@ def site_url(cfg, override=""):
     return f"https://{host}/" if name.lower() == host else f"https://{host}/{name}/"
 
 
-def feed_name(cfg):
-    name = cfg.get("feed", "name").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
-        sys.exit("config.ini: [feed] name must be 1-40 letters, digits, - or _ (it becomes NAME.xml).")
-    return name
+def file_part(text, what):
+    text = text.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", text):
+        sys.exit(f"config.ini: {what} must be 1-40 letters, digits, - or _ (it becomes part of a file name).")
+    return text
+
+
+def load_groups(cfg):
+    """[groups]  1 = kikinda | Title   ->  {"1": {"file": "kikinda", "title": "Title"}}"""
+    groups, used = {}, set()
+    for key, value in cfg.items("groups"):
+        if not key.isdigit():
+            continue
+        name, sep, title = value.partition("|")
+        if not sep or not title.strip():
+            sys.exit(f"config.ini: group {key} must look like:  {key} = file_name | Feed title")
+        fname = file_part(name, f"the file name of group {key}")
+        if fname in used:
+            sys.exit(f"config.ini: two groups use the file name {fname}")
+        used.add(fname)
+        groups[key] = {"file": fname, "title": title.strip()}
+    if not groups:
+        sys.exit("config.ini: define at least one group in the [groups] section, e.g.  1 = rss | My feed")
+    return groups
 
 
 def hubs(cfg):
@@ -336,9 +356,13 @@ def tournament_url(tnr):
 
 
 # ---------------------------------------------------------------- players list
-def parse_players(text, source):
-    """Lines: FIDE_ID [A|I] [M|F] label  (flags in any order; # starts a comment).
-    A = active (default), I = inactive; M = male (default), F = female."""
+GROUPS_RE = re.compile(r"[Gg]?\d+(,\d+)*")
+
+
+def parse_players(text, source, default_groups=()):
+    """Lines: FIDE_ID [A|I] [M|F] [groups] label  (flags in any order; # starts a comment).
+    A = active (default), I = inactive; M = male (default), F = female; groups = numbers like 1 or 1,3
+    (or G1,3); without them the player joins the groups listed as 'default' in config.ini."""
     out, seen = [], set()
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
@@ -347,19 +371,22 @@ def parse_players(text, source):
         tokens = line.split()
         if not tokens[0].isdigit():
             sys.exit(f"{source}: a line must start with a FIDE ID, got: {line!r}")
-        fide_id, rest, sex, state, got = tokens[0], tokens[1:], "M", "A", set()
-        while rest and len(got) < 2:
+        fide_id, rest, sex, state, groups, got = tokens[0], tokens[1:], "M", "A", None, set()
+        while rest and len(got) < 3:
             t = rest[0].upper()
             if t in SEX_TOKENS and "sex" not in got:
                 sex, got = SEX_TOKENS[t], got | {"sex"}
             elif t in STATUS_TOKENS and "state" not in got:
                 state, got = STATUS_TOKENS[t], got | {"state"}
+            elif GROUPS_RE.fullmatch(rest[0]) and "groups" not in got:
+                groups, got = rest[0].lstrip("Gg").split(","), got | {"groups"}
             else:
                 break
             rest = rest[1:]
         if fide_id not in seen:
             seen.add(fide_id)
-            out.append({"fide": fide_id, "sex": sex, "state": state, "label": " ".join(rest), "n": len(out) + 1})
+            out.append({"fide": fide_id, "sex": sex, "state": state, "label": " ".join(rest), "n": len(out) + 1,
+                        "groups": groups if groups is not None else list(default_groups)})
     return out
 
 
@@ -532,10 +559,15 @@ def is_due(player, entry, now, cfg):
 
 
 # ---------------------------------------------------------------- main
-def load_players(path):
+def load_players(path, groups, default_groups):
     if not Path(path).exists():
         sys.exit(f"{path} not found")
-    return parse_players(Path(path).read_text(encoding="utf-8"), path)
+    players = parse_players(Path(path).read_text(encoding="utf-8"), path, default_groups)
+    for p in players:
+        for g in p["groups"]:
+            if g not in groups:
+                sys.exit(f"{path}: player #{p['n']} is in group {g}, which is not defined in config.ini [groups]")
+    return players
 
 
 def player_title(cfg, p):
@@ -577,6 +609,8 @@ def main():
                     help="compare filtered and unfiltered searches for the first 3 players")
     ap.add_argument("--export-env", action="store_true", help="print FEED_REPO and SITE_URL for the workflow")
     ap.add_argument("--websub-ping", action="store_true")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="regenerate the feeds from the saved state without checking any player")
     ap.add_argument("--base", default=BASE)
     ap.add_argument("--fide-field")
     ap.add_argument("--excel-button")
@@ -644,20 +678,23 @@ def main():
     def pause():
         time.sleep(delay + random.uniform(0, jitter))
 
+    default_groups = [g for g in re.split(r"[,\s]+", cfg.get("groups", "default")) if g]
+
     if args.check_filter:
         if searcher is None:
             sys.exit("--check-filter needs network access")
-        check_players = load_players(args.players)
+        check_players = load_players(args.players, load_groups(cfg), default_groups)
         searcher.names = {p["fide"]: p["label"] for p in check_players}
         check_filter(check_players, searcher, today, finished_days, upcoming_days, window, pause)
         log.save(log_hours)
         return
 
     # ------------------------------------------------ normal run
-    fid = feed_name(cfg)
+    groups = load_groups(cfg)
+    prefix = file_part(cfg.get("feed", "player_prefix"), "[feed] player_prefix")
     base = site_url(cfg, args.site_url)
     hub_list = hubs(cfg)
-    players = load_players(args.players)
+    players = load_players(args.players, groups, default_groups)
     order = [p["fide"] for p in players]
     if searcher is not None:
         searcher.names = {p["fide"]: p["label"] for p in players}
@@ -674,13 +711,15 @@ def main():
     due.sort(key=lambda p: (data["players"].get(p["fide"], {}).get("checked_at")
                             or data["players"].get(p["fide"], {}).get("checked", ""), p["n"]))
     max_run = cfg.getint("requests", "max_players_per_run")
-    selected = due[:max_run] if max_run > 0 else due
+    selected = [] if args.rebuild else (due[:max_run] if max_run > 0 else due)
     n_active = sum(1 for p in players if p["state"] == "A")
     print(f"{len(players)} players ({n_active} active, {len(players) - n_active} inactive); "
           f"{len(due)} due at {now.strftime('%H:%M')}, checking {len(selected)} in this run.")
-    if not selected:
+    if not selected and not args.rebuild:
         print("Nothing to do now.")
         return
+    if args.rebuild:
+        print("Rebuild: regenerating the feeds from the saved state, no player is checked.")
 
     # Server-side date filter ("tournament end between"): smaller downloads. It is verified on the fly:
     # if the site rejects it, or answers "nothing" while an unfiltered search finds tournaments, it is switched off.
@@ -779,19 +818,25 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / "index.html").write_text(BLANK_PAGE, encoding="utf-8")
     items = [i for i in data["feed"] if i["fide"] in order]
-    (out / f"{fid}.xml").write_text(render_feed(
-        items, cfg.get("feed", "title").strip(), "Нови уписи играча на турнире (chess-results.com)",
-        base, f"{fid}.xml", hub_list), encoding="utf-8")
     new_files = set()
-    for p in players:
+    for gid, g in groups.items():  # one feed per group
+        members = {p["fide"] for p in players if gid in p["groups"]}
+        mine = [i for i in items if i["fide"] in members]
+        fname = f"{g['file']}.xml"
+        (out / fname).write_text(render_feed(
+            mine, g["title"], f"Нови уписи играча на турнире: {g['title']} (chess-results.com)",
+            base, fname, hub_list), encoding="utf-8")
+        if any(i["id"] not in before_ids for i in mine):
+            new_files.add(fname)
+    for p in players:  # one feed per player
         mine = [i for i in items if i["fide"] == p["fide"]]
-        fname = f"{fid}-{p['fide']}.xml"
+        fname = f"{prefix}-{p['fide']}.xml"
         ptitle = player_title(cfg, p)
         (out / fname).write_text(render_feed(
             mine, ptitle, f"Нови уписи: {ptitle} (chess-results.com)", base, fname, hub_list), encoding="utf-8")
         if any(i["id"] not in before_ids for i in mine):
             new_files.add(fname)
-    ping = [base + f"{fid}.xml"] + [base + f for f in sorted(new_files)] if new_items else []
+    ping = [base + f for f in sorted(new_files)] if new_items else []
 
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "data.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -801,8 +846,8 @@ def main():
     log.save(log_hours)
 
     print(f"Done: {ok} ok, {failures} failed, {len(new_items)} new feed items{', ABORTED' if aborted else ''}.")
-    print(f"Feed: {base}{fid}.xml")
-    if aborted or ok == 0:
+    print("Feeds: " + ", ".join(f"{base}{g['file']}.xml" for g in groups.values()))
+    if aborted or (ok == 0 and not args.rebuild):
         sys.exit(2)
 
 

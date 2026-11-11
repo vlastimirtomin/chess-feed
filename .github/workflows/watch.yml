@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "update = normal run | discover = print the search form's fields | check-filter = test the date filter"
+        description: "update = normal run | rebuild = regenerate the feeds from the saved state (after changing groups or titles) | discover = print the search form's fields | check-filter = test the date filter"
         type: choice
-        options: [update, discover, check-filter]
+        options: [update, rebuild, discover, check-filter]
         default: update
 
 permissions:
@@ -67,8 +67,12 @@ jobs:
         if: ${{ github.event.inputs.mode == 'check-filter' }}
         run: python chess_watch.py --check-filter --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
 
+      - name: Rebuild the feeds (no player is checked)
+        if: ${{ github.event.inputs.mode == 'rebuild' }}
+        run: python chess_watch.py --rebuild --config data/config.ini --players data/players.txt --state-dir data/state --out-dir site --site-url "$SITE_URL" --contact "https://github.com/${{ github.repository }}"
+
       - name: Update tournaments
-        if: ${{ github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' }}
+        if: ${{ github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && github.event.inputs.mode != 'rebuild' }}
         run: python chess_watch.py --config data/config.ini --players data/players.txt --state-dir data/state --out-dir site --site-url "$SITE_URL" --contact "https://github.com/${{ github.repository }}"
 
       - name: Upload the feeds

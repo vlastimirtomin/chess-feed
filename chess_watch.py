@@ -60,6 +60,8 @@ DEFAULTS = {
     "feed": {"player_prefix": "fide", "player_title": "Турнири: {label} - {fide}",
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
     "groups": {"default": ""},
+    "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "max_attempts": "4",
+                "max_per_run": "3", "min_games": "1"},
     "websub": {"enabled": "yes", "hubs": "https://pubsubhubbub.appspot.com/, https://websubhub.com/hub",
                "wait_seconds": "90"},
     "schedule": {"timezone": "Europe/Belgrade", "active_from": "05:00", "active_until": "01:00",
@@ -286,6 +288,16 @@ class Searcher:
         raise NotExcel("response was not an Excel file (saved as debug_response.html)")
 
 
+def _fetch_card(self, tnr, snr, ident):
+    """Plain GET of one player's page in one tournament (art=9)."""
+    self.ctx = ("card", ident)
+    r = self._request("GET", f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&snr={snr}")
+    return r.content.decode("utf-8", errors="replace")
+
+
+Searcher.fetch_card = _fetch_card
+
+
 def discover(searcher):
     action, form = searcher.form()
     print(f"Form action: {action}\n")
@@ -337,6 +349,9 @@ def in_window(df, today, finished_days, upcoming_days):
             "start": iso(r["von"]),
             "end": iso(r["bis"]),
             "rounds": str(r.get("rundenanzahl", "")).strip(),
+            "round_now": str(r.get("rundeaktuell", "")).strip(),
+            "snr": str(r.get("snr", "")).strip(),
+            "rank": str(r.get("rang", "")).strip(),
         })
     return rows
 
@@ -396,7 +411,7 @@ def load_state(path):
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"players": {}}
 
 
-def add_feed_item(data, kind, player, pair, now):
+def add_feed_item(data, kind, player, pair, now, extra=None):
     item_id = f"{kind}:{player['fide']}:{pair['tnr']}"
     if any(i["id"] == item_id for i in data["feed"]):  # never announce the same thing twice
         return
@@ -405,10 +420,11 @@ def add_feed_item(data, kind, player, pair, now):
         "sex": player["sex"], "tnr": pair["tnr"], "tournament": pair["name"], "start": pair["start"],
         "end": pair["end"], "rounds": pair.get("rounds", ""),
         "finished": pair["end"] < now.date().isoformat(), "published": now.isoformat(),
+        **(extra or {}),
     })
 
 
-def track_pairs(data, player, rows, all_tnrs, today, now, announce, suspicious, withdraw_after):
+def track_pairs(data, player, rows, all_tnrs, today, now, announce, suspicious, withdraw_after, results_on=False):
     """Follow (player, tournament) pairs.
 
     - A pair seen for the first time becomes a "join" item (silent baseline when `announce` is False).
@@ -428,10 +444,12 @@ def track_pairs(data, player, rows, all_tnrs, today, now, announce, suspicious, 
         if pair is None:
             pair = pairs[key] = {"fide": fide_id, "tnr": t["tnr"]}
             pair.update(name=t["name"], start=t["start"], end=t["end"], rounds=t["rounds"])
-            if announce:
+            # With result checks on, a tournament found only after it ended is not announced as "played"
+            # here: it goes through the verification below and is announced only if the player really played.
+            if announce and not (results_on and t["end"] < t_iso):
                 add_feed_item(data, "join", player, pair, now)
         pair.update(name=t["name"], start=t["start"], end=t["end"], rounds=t["rounds"],
-                    missing=0, last_miss=None)
+                    round_now=t["round_now"], snr=t["snr"], rank=t["rank"], missing=0, last_miss=None)
 
     if suspicious:
         return
@@ -470,6 +488,14 @@ def item_title(it):
     f = it.get("sex") == "F"
     if it["kind"] == "withdraw":
         return f"{it['player']} више није на стартној листи: {it['tournament']}"
+    if it["kind"] == "result":
+        bits = []
+        if it.get("points"):
+            bits.append(f"{it['points']}/{it['rounds']}" if it.get("rounds") else it["points"])
+        if str(it.get("place", "")).isdigit():  # team events show "-" instead of a place
+            bits.append(f"{it['place']}. место")
+        tail = f" – {', '.join(bits)}" if bits else ""
+        return f"{it['player']} {'је играла на' if f else 'је играо на'}: {it['tournament']}{tail}"
     if it.get("finished"):
         verb = "је учествовала на" if f else "је учествовао на"
     else:
@@ -484,7 +510,7 @@ def render_feed(items, title, description, base, filename, hub_list):
         if it.get("rounds"):
             body += f" · {sr_rounds(it['rounds'])}"
         out.append(
-            f"<item><title>{xe(item_title(it))}</title><link>{xe(tournament_url(it['tnr']))}</link>"
+            f"<item><title>{xe(item_title(it))}</title><link>{xe(it.get('link') or tournament_url(it['tnr']))}</link>"
             f"<guid isPermaLink=\"false\">{xe(it['id'])}</guid>"
             f"<pubDate>{format_datetime(datetime.fromisoformat(it['published']))}</pubDate>"
             f"<description>{xe(body)}</description></item>")
@@ -528,6 +554,109 @@ def websub_ping(cfg, state_dir, log, session):
             log.add("POST websub", hub, ok, detail, time.time() - t0)
             time.sleep(2)
     ping_file.write_text("", encoding="utf-8")
+
+
+# ---------------------------------------------------------------- results of finished tournaments
+PLAYED = {"1", "0", "½", "1/2", "0,5", "0.5"}  # a game that was really played (not a bye or a forfeit)
+OPPONENT_LINK = re.compile(r"art=9.*snr=\d+")
+
+
+def card_url(tnr, snr):
+    return f"{BASE}/tnr{tnr}.aspx?lan={LAN}&art=9&snr={snr}"
+
+
+def parse_card(html, fide_id):
+    """Read the page of one player in one tournament. Labels are the Serbian (lan=14) ones, with English fallbacks."""
+    from bs4 import BeautifulSoup
+
+    clean = lambda t: re.sub(r"\s+", " ", t.replace("\xa0", " ")).strip()
+    soup = BeautifulSoup(html, "html.parser")
+    info = {}
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["td", "th"], recursive=False)
+        if len(cells) == 2:
+            k, v = clean(cells[0].get_text(" ")), clean(cells[1].get_text(" "))
+            if k and v and k not in info:
+                info[k] = v
+    games = []
+    for tr in soup.find_all("tr"):
+        if not tr.find("a", href=OPPONENT_LINK):
+            continue
+        cells = tr.find_all("td", recursive=False)
+        if len(cells) < 4 or not clean(cells[0].get_text(" ")).isdigit():
+            continue
+        games.append({"round": int(clean(cells[0].get_text(" "))), "result": clean(cells[-1].get_text(" "))})
+    last = None
+    m = re.search(r"(?:Последња измена|Last update)\s*(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})",
+                  clean(soup.get_text(" ")))
+    if m:
+        d, mo, y, hh, mi, ss = map(int, m.groups())
+        last = datetime(y, mo, d, hh, mi, ss, tzinfo=TZ)
+    return {"identity_ok": str(fide_id) in info.values(), "games": games, "last_update": last,
+            "points": info.get("Бодови") or info.get("Points") or "",
+            "place": info.get("Место") or info.get("Rank") or ""}
+
+
+def classify_card(card, now, min_games, stable_hours):
+    """competed / not_played / pending (a game has no result yet) / recent (tournament page changed lately) /
+    mismatch (the page is about someone else) / unparsed (no games found)."""
+    if not card["identity_ok"]:
+        return "mismatch"
+    if not card["games"]:
+        return "unparsed"
+    if card["last_update"] and now - card["last_update"] < timedelta(hours=stable_hours):
+        return "recent"
+    if any(g["result"] == "" for g in card["games"]):
+        return "pending"
+    played = sum(1 for g in card["games"] if g["result"] in PLAYED)
+    return "competed" if played >= min_games else "not_played"
+
+
+def result_candidates(data, today, wait_days):
+    """Pairs whose tournament ended more than wait_days ago, shows all rounds as played, and is not decided yet."""
+    limit = (today - timedelta(days=wait_days)).isoformat()
+    out = []
+    for pair in data.get("pairs", {}).values():
+        if pair.get("result") or not pair.get("snr") or pair["end"] >= limit:
+            continue
+        if not pair.get("rounds") or pair.get("round_now") != pair.get("rounds"):
+            continue
+        if pair.get("result_tried") == today.isoformat():
+            continue
+        out.append(pair)
+    out.sort(key=lambda p: (p["end"], p["fide"], p["tnr"]))
+    return out
+
+
+def check_results(players, searcher, cfg, today, now, finished_days, upcoming_days, window, pause, count=3):
+    """Diagnostic: for the first players find a finished tournament, fetch the player's page and show what the
+    script reads from it, so that it can be compared with the page in a browser. Changes nothing."""
+    shown = 0
+    for n, p in enumerate(players):
+        if shown >= count:
+            break
+        if n:
+            pause()
+        df = parse_sheet(searcher.search(p["fide"], window))
+        done = [r for r in in_window(df, today, finished_days, upcoming_days)
+                if status(r, today) == "finished" and r["rounds"] and r["round_now"] == r["rounds"] and r["snr"]]
+        if not done:
+            print(f"player #{p['n']}: no finished tournament in the window")
+            continue
+        r = max(done, key=lambda x: (x["end"], x["tnr"]))
+        pause()
+        card = parse_card(searcher.fetch_card(r["tnr"], r["snr"], f"{p['fide']} {p['label']}".strip()), p["fide"])
+        verdict = classify_card(card, now, cfg.getint("results", "min_games"), cfg.getfloat("results", "stable_hours"))
+        played = sum(1 for g in card["games"] if g["result"] in PLAYED)
+        print(f"player #{p['n']}: {r['name']} (ended {r['end']}, {r['rounds']} rounds)\n"
+              f"   games found: {len(card['games'])}, really played: {played}, results: "
+              f"{[g['result'] for g in card['games']]}\n"
+              f"   points on the page: {card['points'] or '?'}, place: {card['place'] or '?'}, "
+              f"FIDE ID found on the page: {card['identity_ok']}, page last changed: {card['last_update'] or '?'}\n"
+              f"   verdict: {verdict}\n   compare with: {card_url(r['tnr'], r['snr'])}")
+        shown += 1
+    if not shown:
+        print("RESULT: nothing to check.")
 
 
 # ---------------------------------------------------------------- schedule
@@ -609,6 +738,9 @@ def main():
                     help="compare filtered and unfiltered searches for the first 3 players")
     ap.add_argument("--export-env", action="store_true", help="print FEED_REPO and SITE_URL for the workflow")
     ap.add_argument("--websub-ping", action="store_true")
+    ap.add_argument("--check-results", action="store_true",
+                    help="show what the script reads from the player pages of up to 3 finished tournaments")
+    ap.add_argument("--cards-dir", help="testing: read player pages from DIR/TNR_SNR.html instead of the site")
     ap.add_argument("--rebuild", action="store_true",
                     help="regenerate the feeds from the saved state without checking any player")
     ap.add_argument("--base", default=BASE)
@@ -689,6 +821,15 @@ def main():
         log.save(log_hours)
         return
 
+    if args.check_results:
+        if searcher is None:
+            sys.exit("--check-results needs network access")
+        cr_players = load_players(args.players, load_groups(cfg), default_groups)
+        searcher.names = {p["fide"]: p["label"] for p in cr_players}
+        check_results(cr_players, searcher, cfg, today, now, finished_days, upcoming_days, window, pause)
+        log.save(log_hours)
+        return
+
     # ------------------------------------------------ normal run
     groups = load_groups(cfg)
     prefix = file_part(cfg.get("feed", "player_prefix"), "[feed] player_prefix")
@@ -760,6 +901,7 @@ def main():
     max_fail = cfg.getint("requests", "max_failures")
     withdraw_after = cfg.getint("feed", "withdraw_after_days")
     announce_initial = cfg.getboolean("feed", "announce_initial")
+    results_on = cfg.getboolean("results", "enabled")
 
     ok = failures = consecutive = 0
     aborted = None
@@ -780,7 +922,7 @@ def main():
                         announce=(known and had_pairs) or announce_initial,
                         # an empty UNFILTERED answer for a player who had rows before is suspicious
                         suspicious=(not filtered and len(df) == 0 and before.get("rows", 0) > 0),
-                        withdraw_after=withdraw_after)
+                        withdraw_after=withdraw_after, results_on=results_on)
             data["players"][fide_id] = {"checked": today.isoformat(),
                                         "checked_at": clock().isoformat(timespec="seconds"), "rows": len(df)}
             ok += 1
@@ -803,6 +945,48 @@ def main():
                 aborted = f"{consecutive} failures in a row; skipping the rest of this run"
                 print(aborted, file=sys.stderr)
                 break
+
+    # Results of finished tournaments: fetch the player's page once the tournament is over and final, check that the
+    # player really played, and only then announce. A few pages per run, each pair at most once a day.
+    if results_on and not args.rebuild and not aborted:
+        by_fide = {p["fide"]: p for p in players}
+        wait_days, max_tries = cfg.getint("results", "wait_days"), cfg.getint("results", "max_attempts")
+        min_games, stable_hours = cfg.getint("results", "min_games"), cfg.getfloat("results", "stable_hours")
+        todo = [pr for pr in result_candidates(data, today, wait_days) if pr["fide"] in by_fide]
+        todo = todo[:cfg.getint("results", "max_per_run")]
+        for k, pair in enumerate(todo):
+            player = by_fide[pair["fide"]]
+            pair["result_tried"] = today.isoformat()
+            pair["result_tries"] = pair.get("result_tries", 0) + 1
+            try:
+                if args.cards_dir:
+                    html = (Path(args.cards_dir) / f"{pair['tnr']}_{pair['snr']}.html").read_text(encoding="utf-8")
+                else:
+                    if k or selected:
+                        pause()
+                    html = searcher.fetch_card(pair["tnr"], pair["snr"], f"{pair['fide']} {player['label']}".strip())
+                card = parse_card(html, pair["fide"])
+                verdict = classify_card(card, now, min_games, stable_hours)
+            except Blocked as e:
+                aborted = f"blocked ({e}); skipping the rest of this run"
+                print(f"result check: {aborted}", file=sys.stderr)
+                break
+            except (SearchError, OSError) as e:
+                verdict = "fetch_failed"
+                print(f"result check #{k + 1}: FAILED - {e}", file=sys.stderr)
+            if verdict == "competed":
+                place = card["place"] if card["place"].isdigit() else (pair["rank"] if str(pair.get("rank", "")).isdigit() else "")
+                add_feed_item(data, "result", player, pair, now, extra={
+                    "points": card["points"], "place": place, "link": card_url(pair["tnr"], pair["snr"]),
+                    "finished": True})
+                pair["result"] = "announced"
+            elif verdict == "not_played":
+                pair["result"] = "not_played"
+            elif pair["result_tries"] >= max_tries:
+                pair["result"] = "gave_up"
+            print(f"result check #{k + 1}: {verdict}")
+            log.note(f"RESULT | {pair['fide']} | {player['label'] or '-'} | tnr {pair['tnr']} snr {pair['snr']} | "
+                     f"{verdict} (try {pair['result_tries']})")
 
     # Items found in this run: give them publication times one second apart, ordered by tournament date,
     # so that readers show the latest tournament on top.

@@ -667,6 +667,49 @@ def check_results(players, searcher, cfg, today, now, finished_days, upcoming_da
         print("RESULT: nothing to check.")
 
 
+def explain_player(p, searcher, cfg, today, now, finished_days, upcoming_days, window, pause, data, count=3):
+    """Diagnostic for ONE player: every tournament in the window, whether the result check would pick it up,
+    and if not, why. Opens at most `count` player pages. Changes nothing."""
+    give_up = cfg.getint("results", "give_up_days")
+    df = parse_sheet(searcher.search(p["fide"], window))
+    rows = sorted(in_window(df, today, finished_days, upcoming_days), key=lambda r: (r["end"], r["tnr"]), reverse=True)
+    print(f"{len(df)} rows in the search table, {len(rows)} in the window "
+          f"(finished up to {finished_days} days ago, ending within {upcoming_days} days)\n")
+    fetched = 0
+    for r in rows:
+        st = status(r, today)
+        pair = (data or {}).get("pairs", {}).get(f"{p['fide']}:{r['tnr']}", {})
+        print(f"- {r['name']}\n    ended {r['end']} | rounds {r['rounds'] or '?'}, current round {r['round_now'] or '?'} | "
+              f"starting rank (snr) {r['snr'] or '?'} | place in table {r['rank'] or '?'} | dates say: {st}")
+        if pair:
+            print(f"    saved state: result={pair.get('result') or 'not decided'}, tries={pair.get('result_tries', 0)}, "
+                  f"next try not before {pair.get('result_next') or '-'}")
+        if st != "finished":
+            print("    why not: the tournament is not finished according to its dates")
+        elif not r["snr"] or r["snr"] in ("nan", "-"):
+            print("    why not: the search table has no starting rank (snr), so the player's page cannot be opened")
+        elif not r["rounds"] or r["round_now"] != r["rounds"]:
+            print(f"    why not: the table shows round {r['round_now'] or '?'} of {r['rounds'] or '?'}, "
+                  "which is not treated as 'all rounds played'")
+        elif (today - date.fromisoformat(r["end"])).days > give_up:
+            print(f"    why not: ended more than {give_up} days ago (give_up_days)")
+        elif fetched < count:
+            pause()
+            card = parse_card(searcher.fetch_card(r["tnr"], r["snr"], f"{p['fide']} {p['label']}".strip()), p["fide"])
+            fetched += 1
+            verdict = classify_card(card, now, cfg.getint("results", "min_games"), cfg.getfloat("results", "stable_hours"))
+            played = sum(1 for g in card["games"] if g["result"] in PLAYED)
+            print(f"    opened the player's page: games found {len(card['games'])}, really played {played}, results "
+                  f"{[g['result'] for g in card['games']]}\n"
+                  f"    points on the page: {card['points'] or '?'}, place: {card['place'] or '?'}, FIDE ID on the page: "
+                  f"{card['identity_ok']}, page last changed: {card['last_update'] or '?'}\n"
+                  f"    verdict: {verdict}   link: {card_url(r['tnr'], r['snr'])}")
+        else:
+            print("    eligible (page not opened here: limit of pages for this check)")
+    if not rows:
+        print("No tournament of this player in the window.")
+
+
 # ---------------------------------------------------------------- schedule
 def hhmm(text):
     h, m = text.strip().split(":")
@@ -748,6 +791,7 @@ def main():
     ap.add_argument("--websub-ping", action="store_true")
     ap.add_argument("--check-results", action="store_true",
                     help="show what the script reads from the player pages of up to 3 finished tournaments")
+    ap.add_argument("--only-fide", default="", help="with --check-results: explain this one player in detail")
     ap.add_argument("--cards-dir", help="testing: read player pages from DIR/TNR_SNR.html instead of the site")
     ap.add_argument("--rebuild", action="store_true",
                     help="regenerate the feeds from the saved state without checking any player")
@@ -834,7 +878,14 @@ def main():
             sys.exit("--check-results needs network access")
         cr_players = load_players(args.players, load_groups(cfg), default_groups)
         searcher.names = {p["fide"]: p["label"] for p in cr_players}
-        check_results(cr_players, searcher, cfg, today, now, finished_days, upcoming_days, window, pause)
+        only = args.only_fide.strip()
+        if only:
+            target = next((p for p in cr_players if p["fide"] == only),
+                          {"fide": only, "label": "", "n": 0, "sex": "M", "state": "A", "groups": []})
+            explain_player(target, searcher, cfg, today, now, finished_days, upcoming_days, window, pause,
+                           load_state(state_dir / "data.json"))
+        else:
+            check_results(cr_players, searcher, cfg, today, now, finished_days, upcoming_days, window, pause)
         log.save(log_hours)
         return
 

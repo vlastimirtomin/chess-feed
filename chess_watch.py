@@ -578,6 +578,18 @@ def parse_card(html, fide_id):
             k, v = clean(cells[0].get_text(" ")), clean(cells[1].get_text(" "))
             if k and v and k not in info:
                 info[k] = v
+    # Where is the result? On chess-results it sits in a small nested table inside its own cell. Rated tournaments
+    # add more columns after it (expected score, K, rating change), so the last cell is NOT the result there.
+    # Fallback: the position of the "Рез."/"Res." column in the header, counted from the right.
+    from_right = None
+    for tr in soup.find_all("tr"):
+        heads = [clean(c.get_text(" ")) for c in tr.find_all(["th", "td"], recursive=False)]
+        for j, h in enumerate(heads):
+            if h in ("Рез.", "Рез", "Res.", "Res"):
+                from_right = len(heads) - 1 - j
+                break
+        if from_right is not None:
+            break
     games = []
     for tr in soup.find_all("tr"):
         if not tr.find("a", href=OPPONENT_LINK):
@@ -585,7 +597,14 @@ def parse_card(html, fide_id):
         cells = tr.find_all("td", recursive=False)
         if len(cells) < 4 or not clean(cells[0].get_text(" ")).isdigit():
             continue
-        games.append({"round": int(clean(cells[0].get_text(" "))), "result": clean(cells[-1].get_text(" "))})
+        nested = [c for c in cells if c.find("table")]
+        if nested:
+            result = clean(nested[0].get_text(" "))
+        elif from_right is not None and len(cells) > from_right:
+            result = clean(cells[len(cells) - 1 - from_right].get_text(" "))
+        else:
+            result = ""
+        games.append({"round": int(clean(cells[0].get_text(" "))), "result": result})
     last = None
     m = re.search(r"(?:Последња измена|Last update)\s*(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})",
                   clean(soup.get_text(" ")))

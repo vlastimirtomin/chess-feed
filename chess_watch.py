@@ -60,8 +60,8 @@ DEFAULTS = {
     "feed": {"player_prefix": "fide", "player_title": "Турнири: {label} - {fide}",
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
     "groups": {"default": ""},
-    "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "max_attempts": "4",
-                "max_per_run": "3", "min_games": "1"},
+    "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "retry_hours": "4",
+                "retry_other_hours": "24", "give_up_days": "7", "max_per_run": "3", "min_games": "1"},
     "websub": {"enabled": "yes", "hubs": "https://pubsubhubbub.appspot.com/, https://websubhub.com/hub",
                "wait_seconds": "90"},
     "schedule": {"timezone": "Europe/Belgrade", "active_from": "05:00", "active_until": "01:00",
@@ -612,20 +612,28 @@ def classify_card(card, now, min_games, stable_hours):
     return "competed" if played >= min_games else "not_played"
 
 
-def result_candidates(data, today, wait_days):
-    """Pairs whose tournament ended more than wait_days ago, shows all rounds as played, and is not decided yet."""
+def result_candidates(data, now, wait_days, give_up_days):
+    """Pairs whose tournament ended more than wait_days ago and shows all rounds as played.
+    Returns (to_try_now, gave_up): a pair is skipped until its next allowed try, and given up on
+    when its tournament ended more than give_up_days ago."""
+    today = now.date()
     limit = (today - timedelta(days=wait_days)).isoformat()
-    out = []
+    todo, gave_up = [], []
     for pair in data.get("pairs", {}).values():
         if pair.get("result") or not pair.get("snr") or pair["end"] >= limit:
             continue
         if not pair.get("rounds") or pair.get("round_now") != pair.get("rounds"):
             continue
-        if pair.get("result_tried") == today.isoformat():
+        if (today - date.fromisoformat(pair["end"])).days > give_up_days:
+            pair["result"] = "gave_up"
+            gave_up.append(pair)
             continue
-        out.append(pair)
-    out.sort(key=lambda p: (p["end"], p["fide"], p["tnr"]))
-    return out
+        nxt = pair.get("result_next")
+        if nxt and now < datetime.fromisoformat(nxt) - DUE_SLACK:
+            continue
+        todo.append(pair)
+    todo.sort(key=lambda p: (p.get("result_tries", 0), p["end"], p["fide"], p["tnr"]))
+    return todo, gave_up
 
 
 def check_results(players, searcher, cfg, today, now, finished_days, upcoming_days, window, pause, count=3):
@@ -846,6 +854,11 @@ def main():
     data["players"] = {k: v for k, v in data["players"].items() if k in order}
     before_ids = {i["id"] for i in data["feed"]}
 
+    results_on = cfg.getboolean("results", "enabled")
+    wait_days, give_up_days = cfg.getint("results", "wait_days"), cfg.getint("results", "give_up_days")
+    retry_hours, retry_other = cfg.getfloat("results", "retry_hours"), cfg.getfloat("results", "retry_other_hours")
+    min_games, stable_hours = cfg.getint("results", "min_games"), cfg.getfloat("results", "stable_hours")
+
     # Who is due now? Active players inside the active window every active_every_hours, inactive players inside the
     # inactive window every inactive_every_hours, new players immediately. Longest-waiting first, at most max_players_per_run.
     due = [p for p in players if is_due(p, data["players"].get(p["fide"]), now, cfg)]
@@ -856,7 +869,8 @@ def main():
     n_active = sum(1 for p in players if p["state"] == "A")
     print(f"{len(players)} players ({n_active} active, {len(players) - n_active} inactive); "
           f"{len(due)} due at {now.strftime('%H:%M')}, checking {len(selected)} in this run.")
-    if not selected and not args.rebuild:
+    waiting = result_candidates(data, now, wait_days, give_up_days)[0] if results_on and not args.rebuild else []
+    if not selected and not waiting and not args.rebuild:
         print("Nothing to do now.")
         return
     if args.rebuild:
@@ -901,7 +915,6 @@ def main():
     max_fail = cfg.getint("requests", "max_failures")
     withdraw_after = cfg.getint("feed", "withdraw_after_days")
     announce_initial = cfg.getboolean("feed", "announce_initial")
-    results_on = cfg.getboolean("results", "enabled")
 
     ok = failures = consecutive = 0
     aborted = None
@@ -947,16 +960,24 @@ def main():
                 break
 
     # Results of finished tournaments: fetch the player's page once the tournament is over and final, check that the
-    # player really played, and only then announce. A few pages per run, each pair at most once a day.
+    # player really played, and only then announce. A few pages per run. A tournament whose results are not final yet
+    # is tried again after retry_hours; a page that cannot be read after retry_other_hours; after give_up_days: no more.
     if results_on and not args.rebuild and not aborted:
         by_fide = {p["fide"]: p for p in players}
-        wait_days, max_tries = cfg.getint("results", "wait_days"), cfg.getint("results", "max_attempts")
-        min_games, stable_hours = cfg.getint("results", "min_games"), cfg.getfloat("results", "stable_hours")
-        todo = [pr for pr in result_candidates(data, today, wait_days) if pr["fide"] in by_fide]
-        todo = todo[:cfg.getint("results", "max_per_run")]
-        for k, pair in enumerate(todo):
+        todo, gave_up = result_candidates(data, now, wait_days, give_up_days)
+        for pair in gave_up:
+            if pair["fide"] in by_fide:
+                log.note(f"RESULT | {pair['fide']} | {by_fide[pair['fide']]['label'] or '-'} | tnr {pair['tnr']} | "
+                         f"gave up (ended more than {give_up_days} days ago)")
+        todo = [pr for pr in todo if pr["fide"] in by_fide]
+        max_pages, k = cfg.getint("results", "max_per_run"), 0
+        for pair in todo:
+            nxt = pair.get("result_next")
+            if nxt and now < datetime.fromisoformat(nxt) - DUE_SLACK:
+                continue  # another player's page of the same tournament showed that it is not final yet
+            if k >= max_pages:
+                break
             player = by_fide[pair["fide"]]
-            pair["result_tried"] = today.isoformat()
             pair["result_tries"] = pair.get("result_tries", 0) + 1
             try:
                 if args.cards_dir:
@@ -982,9 +1003,15 @@ def main():
                 pair["result"] = "announced"
             elif verdict == "not_played":
                 pair["result"] = "not_played"
-            elif pair["result_tries"] >= max_tries:
-                pair["result"] = "gave_up"
-            print(f"result check #{k + 1}: {verdict}")
+            else:
+                hours = retry_hours if verdict in ("pending", "recent") else retry_other
+                pair["result_next"] = (clock() + timedelta(hours=hours)).isoformat(timespec="seconds")
+                if verdict == "recent":  # the tournament page changed lately: true for every player in it
+                    for other in data["pairs"].values():
+                        if other["tnr"] == pair["tnr"] and not other.get("result") and other is not pair:
+                            other["result_next"] = pair["result_next"]
+            k += 1
+            print(f"result check #{k}: {verdict}")
             log.note(f"RESULT | {pair['fide']} | {player['label'] or '-'} | tnr {pair['tnr']} snr {pair['snr']} | "
                      f"{verdict} (try {pair['result_tries']})")
 

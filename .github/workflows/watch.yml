@@ -12,6 +12,11 @@ on:
         type: choice
         options: [update, rebuild, discover, check-filter, check-results]
         default: update
+      fide:
+        description: "only for check-results: a FIDE ID to explain in detail (leave empty to check the first players)"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write   # only for the small keep-alive commit at the end
@@ -71,7 +76,7 @@ jobs:
 
       - name: Check the reading of results pages
         if: ${{ github.event.inputs.mode == 'check-results' }}
-        run: python chess_watch.py --check-results --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
+        run: python chess_watch.py --check-results --only-fide "${{ github.event.inputs.fide }}" --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
 
       - name: Rebuild the feeds (no player is checked)
         if: ${{ github.event.inputs.mode == 'rebuild' }}

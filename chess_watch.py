@@ -60,6 +60,7 @@ DEFAULTS = {
     "feed": {"player_prefix": "fide", "player_title": "Турнири: {label} - {fide}",
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
     "groups": {"default": ""},
+    "details": {"enabled": "yes", "max_per_run": "10", "wait_hours": "12"},
     "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "retry_hours": "4",
                 "retry_other_hours": "24", "give_up_days": "7", "recheck_days": "3", "max_per_run": "3",
                 "min_games": "1"},
@@ -292,7 +293,7 @@ class Searcher:
 def _fetch_card(self, tnr, snr, ident):
     """Plain GET of one player's page in one tournament (art=9)."""
     self.ctx = ("card", ident)
-    r = self._request("GET", f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&snr={snr}")
+    r = self._request("GET", f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&turdet=YES&snr={snr}")
     return r.content.decode("utf-8", errors="replace")
 
 
@@ -434,7 +435,8 @@ def add_feed_item(data, kind, player, pair, now, extra=None):
     })
 
 
-def track_pairs(data, player, rows, all_tnrs, today, now, announce, suspicious, withdraw_after, results_on=False):
+def track_pairs(data, player, rows, all_tnrs, today, now, announce, suspicious, withdraw_after, results_on=False,
+                join_pending=False):
     """Follow (player, tournament) pairs.
 
     - A pair seen for the first time becomes a "join" item (silent baseline when `announce` is False).
@@ -457,7 +459,10 @@ def track_pairs(data, player, rows, all_tnrs, today, now, announce, suspicious, 
             # With result checks on, a tournament found only after it ended is not announced as "played"
             # here: it goes through the verification below and is announced only if the player really played.
             if announce and not (results_on and t["end"] < t_iso):
-                add_feed_item(data, "join", player, pair, now)
+                if join_pending:  # announced a little later, together with the tournament's data
+                    pair["join_pending"] = now.isoformat(timespec="seconds")
+                else:
+                    add_feed_item(data, "join", player, pair, now)
         pair.update(name=t["name"], start=t["start"], end=t["end"], rounds=t["rounds"],
                     round_now=t["round_now"], snr=t["snr"], rank=t["rank"], missing=0, last_miss=None)
 
@@ -640,7 +645,8 @@ def parse_card(html, fide_id):
                       ("avg", (r"^(Просечан рејтинг|Rating-?\s?Ø|Average rating)",))):
         v = pick(*pats)[1]
         if v:
-            tour[key] = re.sub(r"(\d{4})/(\d{2})/(\d{2})", r"\3.\2.\1.", v)
+            v = re.sub(r"(\d{4})/(\d{2})/(\d{2})", r"\3.\2.\1.", v)
+            tour[key] = re.sub(r"\s+(to|до)\s+", " – ", v) if key == "date" else v
     for key, pats in (("snr", (r"^(Носилац|Starting rank|Startrang)$",)),
                       ("rating", (r"^(Рејтинг|Rating)$",)),
                       ("perf", (r"^(Рејтинг перформанс|Rating performance|Performance)",)),
@@ -691,8 +697,9 @@ def item_body_html(it):
     if any(shown(t.get(k)) for k, _ in T_LABELS):
         parts.append("<p><b>Подаци о турниру</b></p><ul>" + "".join(
             f"<li>{xe(lbl)}: {xe(t[k])}</li>" for k, lbl in T_LABELS if shown(t.get(k))) + "</ul>")
-    parts.append("<p><b>Подаци о играчу</b></p><ul>" + "".join(
-        f"<li>{xe(lbl)}: {xe(pl[k])}</li>" for k, lbl in P_LABELS if shown(pl.get(k))) + "</ul>")
+    if any(shown(pl.get(k)) for k, _ in P_LABELS):
+        parts.append("<p><b>Подаци о играчу</b></p><ul>" + "".join(
+            f"<li>{xe(lbl)}: {xe(pl[k])}</li>" for k, lbl in P_LABELS if shown(pl.get(k))) + "</ul>")
     return "".join(parts)
 
 
@@ -1037,6 +1044,8 @@ def main():
     retry_hours, retry_other = cfg.getfloat("results", "retry_hours"), cfg.getfloat("results", "retry_other_hours")
     min_games, stable_hours = cfg.getint("results", "min_games"), cfg.getfloat("results", "stable_hours")
     recheck_days = cfg.getint("results", "recheck_days")
+    details_on = cfg.getboolean("details", "enabled")
+    details_max, details_wait = cfg.getint("details", "max_per_run"), cfg.getfloat("details", "wait_hours")
 
     # Who is due now? Active players inside the active window every active_every_hours, inactive players inside the
     # inactive window every inactive_every_hours, new players immediately. Longest-waiting first, at most max_players_per_run.
@@ -1051,6 +1060,8 @@ def main():
           f"{len(due)} due at {now.strftime('%H:%M')}, checking {len(selected)} in this run.")
     waiting = (result_candidates(data, now, wait_days, give_up_days)[0]
                + recheck_candidates(data, now, recheck_days, give_up_days)) if results_on and not args.rebuild else []
+    if details_on and not args.rebuild:
+        waiting += [pr for pr in data.get("pairs", {}).values() if pr.get("join_pending")]
     if not selected and not waiting and not args.rebuild:
         print("Nothing to do now.")
         return
@@ -1131,7 +1142,7 @@ def main():
                         announce=(known and had_pairs) or announce_initial,
                         # an empty UNFILTERED answer for a player who had rows before is suspicious
                         suspicious=(not filtered and len(df) == 0 and before.get("rows", 0) > 0),
-                        withdraw_after=withdraw_after, results_on=results_on)
+                        withdraw_after=withdraw_after, results_on=results_on, join_pending=details_on)
             data["players"][fide_id] = {"checked": today.isoformat(),
                                         "checked_at": clock().isoformat(timespec="seconds"), "rows": len(df)}
             ok += 1
@@ -1157,6 +1168,55 @@ def main():
                 aborted = f"{consecutive} failures in a row; skipping the rest of this run"
                 print(aborted, file=sys.stderr)
                 break
+
+    # Sign-ups: the item for a new tournament carries the tournament's data (time control, location, ...). One page per
+    # tournament, shared by all players, at most details_max per run. If the page cannot be had, the announcement waits
+    # up to details_wait hours and then goes out without the data. Nothing is lost if chess-results does not answer.
+    flags = {"requests": bool(selected)}
+    if details_on and not args.rebuild and not aborted:
+        by_fide = {p["fide"]: p for p in players}
+        tcache = data.setdefault("tournaments", {})
+        fetched = fail_streak = 0
+        pending = sorted((pr for pr in data.get("pairs", {}).values() if pr.get("join_pending")),
+                         key=lambda pr: (pr["join_pending"], pr["fide"], pr["tnr"]))
+        for pair in pending:
+            player = by_fide.get(pair["fide"])
+            if not player:
+                pair.pop("join_pending", None)
+                continue
+            tinfo = tcache.get(pair["tnr"])
+            if (tinfo is None and fetched < details_max and fail_streak < 2
+                    and str(pair.get("snr", "")).strip() not in ("", "nan", "-")):
+                try:
+                    if args.cards_dir:
+                        html = (Path(args.cards_dir) / f"{pair['tnr']}_{pair['snr']}.html").read_text(encoding="utf-8")
+                    else:
+                        if flags["requests"]:
+                            pause()
+                        flags["requests"] = True
+                        html = searcher.fetch_card(pair["tnr"], pair["snr"], f"{pair['fide']} {player['label']}".strip())
+                    fetched += 1
+                    t = parse_card(html, pair["fide"])["tournament"]
+                    if t:
+                        tcache[pair["tnr"]] = tinfo = {"t": t, "at": today.isoformat()}
+                        fail_streak = 0
+                    else:
+                        fail_streak += 1
+                        print("tournament data: the page has no tournament details", file=sys.stderr)
+                except Blocked as e:
+                    aborted = f"blocked ({e}); skipping the rest of this run"
+                    print(f"tournament data: {aborted}", file=sys.stderr)
+                    break
+                except (SearchError, OSError) as e:
+                    fetched += 1
+                    fail_streak += 1
+                    print(f"tournament data: FAILED - {e}", file=sys.stderr)
+            if tinfo or now - datetime.fromisoformat(pair["join_pending"]) >= timedelta(hours=details_wait):
+                add_feed_item(data, "join", player, pair, now, extra={"details": {"t": tinfo["t"]}} if tinfo else None)
+                pair.pop("join_pending", None)
+                log.note(f"JOIN | {pair['fide']} | {player['label'] or '-'} | tnr {pair['tnr']} | announced "
+                         + ("with tournament data" if tinfo else "WITHOUT tournament data"))
+                save_progress()
 
     # Results of finished tournaments. Once a tournament is over and final, the player's page is fetched (a few per run),
     # and only if the player really played is a result announced, with the tournament's and the player's data in its body.
@@ -1189,8 +1249,9 @@ def main():
                 if args.cards_dir:
                     html = (Path(args.cards_dir) / f"{pair['tnr']}_{pair['snr']}.html").read_text(encoding="utf-8")
                 else:
-                    if k or selected:
+                    if k or flags["requests"]:
                         pause()
+                    flags["requests"] = True
                     html = searcher.fetch_card(pair["tnr"], pair["snr"], f"{pair['fide']} {player['label']}".strip())
                 card = parse_card(html, pair["fide"])
                 verdict = classify_card(card, now, min_games, stable_hours)

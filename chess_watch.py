@@ -60,7 +60,8 @@ DEFAULTS = {
     "feed": {"player_prefix": "fide", "player_title": "Турнири: {label} - {fide}",
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
     "groups": {"default": ""},
-    "details": {"enabled": "yes", "max_per_run": "10", "wait_hours": "12"},
+    "details": {"enabled": "yes", "max_per_run": "10", "wait_hours": "12", "cache_days": "2",
+                "join_hide_average": "yes"},
     "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "retry_hours": "4",
                 "retry_other_hours": "24", "give_up_days": "7", "recheck_days": "3", "max_per_run": "3",
                 "min_games": "1"},
@@ -668,6 +669,9 @@ P_LABELS = (("snr", "Носилац"), ("rating", "Рејтинг"), ("perf", "�
             ("points", "Бодови"), ("played", "Број одиграних кола"), ("place", "Место"))
 
 
+JOIN_HIDE = {"avg"}  # fields left out of sign-up items (they change until the tournament starts); set from config
+
+
 def snapshot_of(card):
     """What counts as 'the player's result': used to notice later corrections."""
     return {**card["player"], "results": card["results"]}
@@ -694,9 +698,10 @@ def item_body_html(it):
         parts.append("<p><b>Измене</b></p><ul>" + "".join(
             f"<li>{xe(lbl)}: {xe(old)} → {xe(new)}</li>" for lbl, old, new in it["changes"]) + "</ul>")
     t, pl = det.get("t", {}), det.get("p", {})
-    if any(shown(t.get(k)) for k, _ in T_LABELS):
+    hidden = JOIN_HIDE if it["kind"] == "join" else set()
+    if any(shown(t.get(k)) for k, _ in T_LABELS if k not in hidden):
         parts.append("<p><b>Подаци о турниру</b></p><ul>" + "".join(
-            f"<li>{xe(lbl)}: {xe(t[k])}</li>" for k, lbl in T_LABELS if shown(t.get(k))) + "</ul>")
+            f"<li>{xe(lbl)}: {xe(t[k])}</li>" for k, lbl in T_LABELS if shown(t.get(k)) and k not in hidden) + "</ul>")
     if any(shown(pl.get(k)) for k, _ in P_LABELS):
         parts.append("<p><b>Подаци о играчу</b></p><ul>" + "".join(
             f"<li>{xe(lbl)}: {xe(pl[k])}</li>" for k, lbl in P_LABELS if shown(pl.get(k))) + "</ul>")
@@ -913,6 +918,7 @@ def check_filter(players, searcher, today, finished_days, upcoming_days, window,
 
 
 def main():
+    global TZ, JOIN_HIDE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="config.ini")
     ap.add_argument("--players", default="players.txt")
@@ -941,7 +947,7 @@ def main():
 
     cfg = load_config(args.config)
     state_dir = Path(args.state_dir)
-    global TZ
+    JOIN_HIDE = {"avg"} if cfg.getboolean("details", "join_hide_average") else set()
     try:
         from zoneinfo import ZoneInfo as _ZI
 
@@ -1046,6 +1052,7 @@ def main():
     recheck_days = cfg.getint("results", "recheck_days")
     details_on = cfg.getboolean("details", "enabled")
     details_max, details_wait = cfg.getint("details", "max_per_run"), cfg.getfloat("details", "wait_hours")
+    cache_days = cfg.getint("details", "cache_days")
 
     # Who is due now? Active players inside the active window every active_every_hours, inactive players inside the
     # inactive window every inactive_every_hours, new players immediately. Longest-waiting first, at most max_players_per_run.
@@ -1185,6 +1192,9 @@ def main():
                 pair.pop("join_pending", None)
                 continue
             tinfo = tcache.get(pair["tnr"])
+            stale = None
+            if tinfo and (today - date.fromisoformat(tinfo["at"])).days > cache_days:
+                stale, tinfo = tinfo, None  # too old: read the page again; the old data is the fallback
             if (tinfo is None and fetched < details_max and fail_streak < 2
                     and str(pair.get("snr", "")).strip() not in ("", "nan", "-")):
                 try:
@@ -1211,6 +1221,7 @@ def main():
                     fetched += 1
                     fail_streak += 1
                     print(f"tournament data: FAILED - {e}", file=sys.stderr)
+            tinfo = tinfo or stale
             if tinfo or now - datetime.fromisoformat(pair["join_pending"]) >= timedelta(hours=details_wait):
                 add_feed_item(data, "join", player, pair, now, extra={"details": {"t": tinfo["t"]}} if tinfo else None)
                 pair.pop("join_pending", None)

@@ -288,6 +288,11 @@ class Searcher:
             self.action = None
             time.sleep(3)
         Path("debug_response.html").write_bytes(r.content)
+        if self.fide_field and self.fide_field.encode() in r.content:
+            # The normal search page came back twice, each time with a fresh form, and offered no Excel file:
+            # the search has no rows (for example no tournament in the date window).
+            self.log.add("POST search", self.ctx[1], True, "no Excel file offered: treated as no rows", 0)
+            return b""
         raise NotExcel("response was not an Excel file (saved as debug_response.html)")
 
 
@@ -319,6 +324,9 @@ def discover(searcher):
 def parse_sheet(data):
     import pandas as pd
 
+    if not data:  # the site offered no file because the search found nothing
+        return pd.DataFrame(columns=["spieler", "fideident", "snr", "rang", "n", "turname", "rundenanzahl",
+                                     "rundeaktuell", "von", "bis", "tnr"])
     raw = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
     hdr = next((i for i, row in raw.iterrows()
                 if "tnr" in [str(v).strip().lower() for v in row]), None)
@@ -843,6 +851,15 @@ def explain_player(p, searcher, cfg, today, now, finished_days, upcoming_days, w
             print("    eligible (page not opened here: limit of pages for this check)")
     if not rows:
         print("No tournament of this player in the window.")
+        pause()
+        full = parse_sheet(searcher.search(p["fide"]))
+        if len(full):
+            ends = sorted(str(v) for v in full["bis"] if str(v).strip().isdigit())
+            print(f"Without the date window the search table has {len(full)} rows; the most recent tournament ended "
+                  f"{iso(ends[-1]) if ends else '?'}.")
+        else:
+            print("Without the date window the search finds nothing either: no tournament is known for this FIDE ID, "
+                  "or the ID is wrong.")
 
 
 # ---------------------------------------------------------------- schedule
@@ -1099,15 +1116,24 @@ def main():
                 filter_state["ok"] = False
                 warn("date fields not found on the form; continuing without the filter")
                 return df, False
-            if len(df) > 0 or filter_state["ok"] is True:
+            if len(df) > 0:
                 filter_state["ok"] = True
                 return df, True
-            pause()  # empty answer while still unverified: compare once with an unfiltered search
+            # An empty answer. Compare once with an unfiltered search when the filter is not verified yet, or when the
+            # player has open tournaments (then "nothing" would mean either "left them all" or a hiccup of the site).
+            open_pairs = any(pr["fide"] == fide_id and pr["end"] >= today.isoformat()
+                             for pr in data.get("pairs", {}).values())
+            if filter_state["ok"] is True and not open_pairs:
+                return df, True
+            pause()
             full = parse_sheet(searcher.search(fide_id))
-            if in_window(full, today, finished_days, upcoming_days):
+            if filter_state["ok"] is not True and in_window(full, today, finished_days, upcoming_days):
                 filter_state["ok"] = False
                 warn("the date filter returned nothing although tournaments exist; continuing without it")
                 return full, False
+            if len(full) == 0:
+                return full, False  # nothing at all, even without the filter: not trusted (see "suspicious" below)
+            filter_state["ok"] = filter_state["ok"] or None
             return df, True
         return parse_sheet(searcher.search(fide_id)), False
 
@@ -1148,7 +1174,9 @@ def main():
             track_pairs(data, player, rows, set(df["tnr"].astype(str).str.strip()), today, now,
                         announce=(known and had_pairs) or announce_initial,
                         # an empty UNFILTERED answer for a player who had rows before is suspicious
-                        suspicious=(not filtered and len(df) == 0 and before.get("rows", 0) > 0),
+                        suspicious=(not filtered and len(df) == 0 and (before.get("rows", 0) > 0 or any(
+                            pr["fide"] == fide_id and pr["end"] >= today.isoformat()
+                            for pr in data.get("pairs", {}).values()))),
                         withdraw_after=withdraw_after, results_on=results_on, join_pending=details_on)
             data["players"][fide_id] = {"checked": today.isoformat(),
                                         "checked_at": clock().isoformat(timespec="seconds"), "rows": len(df)}

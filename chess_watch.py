@@ -29,7 +29,7 @@ SEARCH_PATH = "/SpielerSuche.aspx"
 LAN = "14"  # Serbian: used for the search page and for every generated link
 EXCEL_RE = re.compile(r"excel|xls|екцел|ексел", re.I)
 SEX_TOKENS = {"M": "M", "F": "F", "М": "M", "Ж": "F"}  # Latin M/F and Cyrillic М/Ж
-STATUS_TOKENS = {"A": "A", "I": "I", "А": "A", "И": "I"}  # Active / Inactive (Latin or Cyrillic)
+STATUS_TOKENS = {"A": "A", "I": "I", "R": "R", "А": "A", "И": "I", "Р": "R"}  # Active / Inactive / Retired (Latin or Cyrillic)
 DUE_SLACK = timedelta(minutes=45)  # a run may start a little earlier than "every N hours" after the last check
 
 try:
@@ -61,12 +61,13 @@ DEFAULTS = {
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
     "groups": {"default": ""},
     "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "retry_hours": "4",
-                "retry_other_hours": "24", "give_up_days": "7", "max_per_run": "3", "min_games": "1"},
+                "retry_other_hours": "24", "give_up_days": "7", "recheck_days": "3", "max_per_run": "3",
+                "min_games": "1"},
     "websub": {"enabled": "yes", "hubs": "https://pubsubhubbub.appspot.com/, https://websubhub.com/hub",
                "wait_seconds": "90"},
     "schedule": {"timezone": "Europe/Belgrade", "active_from": "05:00", "active_until": "01:00",
                  "inactive_from": "01:00", "inactive_until": "05:00",
-                 "active_every_hours": "4", "inactive_every_hours": "20"},
+                 "active_every_hours": "4", "inactive_every_hours": "20", "retired_day": "1"},
     "publish": {"feed_repo": ""},
     "log": {"hours": "48"},
 }
@@ -406,6 +407,15 @@ def parse_players(text, source, default_groups=()):
 
 
 # ---------------------------------------------------------------- state + feed items
+def write_state(path, data):
+    """Write the state file in one piece (temporary file, then rename), so a stopped run never leaves half a file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
 def load_state(path):
     p = Path(path)
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"players": {}}
@@ -488,14 +498,15 @@ def item_title(it):
     f = it.get("sex") == "F"
     if it["kind"] == "withdraw":
         return f"{it['player']} више није на стартној листи: {it['tournament']}"
-    if it["kind"] == "result":
+    if it["kind"] in ("result", "correction"):
         bits = []
         if it.get("points"):
             bits.append(f"{it['points']}/{it['rounds']}" if it.get("rounds") else it["points"])
         if str(it.get("place", "")).isdigit():  # team events show "-" instead of a place
             bits.append(f"{it['place']}. место")
         tail = f" – {', '.join(bits)}" if bits else ""
-        return f"{it['player']} {'је играла на' if f else 'је играо на'}: {it['tournament']}{tail}"
+        title = f"{it['player']} {'је играла на' if f else 'је играо на'}: {it['tournament']}{tail}"
+        return "ИСПРАВКА: " + title if it["kind"] == "correction" else title
     if it.get("finished"):
         verb = "је учествовала на" if f else "је учествовао на"
     else:
@@ -513,7 +524,7 @@ def render_feed(items, title, description, base, filename, hub_list):
             f"<item><title>{xe(item_title(it))}</title><link>{xe(it.get('link') or tournament_url(it['tnr']))}</link>"
             f"<guid isPermaLink=\"false\">{xe(it['id'])}</guid>"
             f"<pubDate>{format_datetime(datetime.fromisoformat(it['published']))}</pubDate>"
-            f"<description>{xe(body)}</description></item>")
+            f"<description>{xe(item_body_html(it) or body)}</description></item>")
     last = max((i["published"] for i in items), default=None)
     build = f"<lastBuildDate>{format_datetime(datetime.fromisoformat(last))}</lastBuildDate>" if last else ""
     links = "".join(f"<atom:link rel=\"hub\" href=\"{xe(h)}\"/>" for h in hub_list)
@@ -611,9 +622,78 @@ def parse_card(html, fide_id):
     if m:
         d, mo, y, hh, mi, ss = map(int, m.groups())
         last = datetime(y, mo, d, hh, mi, ss, tzinfo=TZ)
+    def pick(*patterns):
+        for k, v in info.items():
+            if any(re.search(pt, k, re.I) for pt in patterns):
+                return k, v
+        return "", ""
+
+    tour, pl = {}, {}
+    k, v = pick(r"^(Bedenkzeit|Time control)")
+    if v:
+        cat = re.search(r"\(([^)]*)\)", k)
+        tour["time"] = v + (f" ({cat.group(1)})" if cat else "")
+    for key, pats in (("location", (r"^(Страна|Location|Venue|Ort)$",)),
+                      ("rounds", (r"^(Number of rounds|Број кола|Anzahl der Runden)",)),
+                      ("type", (r"^(Tournament type|Врста турнира|Тип турнира|Turniermodus|Turnierart)",)),
+                      ("date", (r"^(Датум|Date|Datum)$",)),
+                      ("avg", (r"^(Просечан рејтинг|Rating-?\s?Ø|Average rating)",))):
+        v = pick(*pats)[1]
+        if v:
+            tour[key] = re.sub(r"(\d{4})/(\d{2})/(\d{2})", r"\3.\2.\1.", v)
+    for key, pats in (("snr", (r"^(Носилац|Starting rank|Startrang)$",)),
+                      ("rating", (r"^(Рејтинг|Rating)$",)),
+                      ("perf", (r"^(Рејтинг перформанс|Rating performance|Performance)",)),
+                      ("change", (r"^(ФИДЕ ртг|FIDE rtg|FIDE Rtg|Rtg\s?\+/-)",)),
+                      ("points", (r"^(Бодови|Points)$",)),
+                      ("place", (r"^(Место|Rank)$",))):
+        v = pick(*pats)[1]
+        if v:
+            pl[key] = v
+    pl["played"] = str(sum(1 for g in games if g["result"] in PLAYED))
     return {"identity_ok": str(fide_id) in info.values(), "games": games, "last_update": last,
-            "points": info.get("Бодови") or info.get("Points") or "",
-            "place": info.get("Место") or info.get("Rank") or ""}
+            "points": pl.get("points", ""), "place": pl.get("place", ""), "tournament": tour, "player": pl,
+            "results": " ".join(g["result"] for g in games)}
+
+
+T_LABELS = (("time", "Временска контрола"), ("location", "Локација"), ("rounds", "Број кола"),
+            ("type", "Врста турнира"), ("date", "Датум"), ("avg", "Просечан рејтинг и старост учесника"))
+P_LABELS = (("snr", "Носилац"), ("rating", "Рејтинг"), ("perf", "Рејтинг перформанс"), ("change", "ФИДЕ ртг + / -"),
+            ("points", "Бодови"), ("played", "Број одиграних кола"), ("place", "Место"))
+
+
+def snapshot_of(card):
+    """What counts as 'the player's result': used to notice later corrections."""
+    return {**card["player"], "results": card["results"]}
+
+
+def diff_snapshots(old, new):
+    labels = dict(P_LABELS)
+    labels["results"] = "Резултати по колима"
+    changes = []
+    for key in [k for k, _ in P_LABELS] + ["results"]:
+        if old.get(key, "") != new.get(key, ""):
+            changes.append([labels[key], old.get(key, "") or "-", new.get(key, "") or "-"])
+    return changes
+
+
+def item_body_html(it):
+    """HTML body of a result item, or None for items without details."""
+    det = it.get("details")
+    if not det:
+        return None
+    shown = lambda v: v and v != "-"
+    parts = []
+    if it["kind"] == "correction" and it.get("changes"):
+        parts.append("<p><b>Измене</b></p><ul>" + "".join(
+            f"<li>{xe(lbl)}: {xe(old)} → {xe(new)}</li>" for lbl, old, new in it["changes"]) + "</ul>")
+    t, pl = det.get("t", {}), det.get("p", {})
+    if any(shown(t.get(k)) for k, _ in T_LABELS):
+        parts.append("<p><b>Подаци о турниру</b></p><ul>" + "".join(
+            f"<li>{xe(lbl)}: {xe(t[k])}</li>" for k, lbl in T_LABELS if shown(t.get(k))) + "</ul>")
+    parts.append("<p><b>Подаци о играчу</b></p><ul>" + "".join(
+        f"<li>{xe(lbl)}: {xe(pl[k])}</li>" for k, lbl in P_LABELS if shown(pl.get(k))) + "</ul>")
+    return "".join(parts)
 
 
 def classify_card(card, now, min_games, stable_hours):
@@ -653,6 +733,30 @@ def result_candidates(data, now, wait_days, give_up_days):
         todo.append(pair)
     todo.sort(key=lambda p: (p.get("result_tries", 0), p["end"], p["fide"], p["tnr"]))
     return todo, gave_up
+
+
+def recheck_candidates(data, now, recheck_days, give_up_days):
+    """Announced results to look at once more, recheck_days after the end of the tournament."""
+    if recheck_days <= 0:
+        return []
+    today, out = now.date(), []
+    for pair in data.get("pairs", {}).values():
+        if pair.get("result") != "announced" or not pair.get("snapshot") or pair.get("recheck"):
+            continue
+        age = (today - date.fromisoformat(pair["end"])).days
+        if age < recheck_days:
+            continue
+        if age > recheck_days + give_up_days:
+            pair["recheck"] = "gave_up"
+            continue
+        if pair.get("announced_at") and now < datetime.fromisoformat(pair["announced_at"]) + timedelta(hours=24):
+            continue  # at least a day after the announcement
+        nxt = pair.get("recheck_next")
+        if nxt and now < datetime.fromisoformat(nxt) - DUE_SLACK:
+            continue
+        out.append(pair)
+    out.sort(key=lambda p: (p["end"], p["fide"], p["tnr"]))
+    return out
 
 
 def check_results(players, searcher, cfg, today, now, finished_days, upcoming_days, window, pause, count=3):
@@ -750,8 +854,12 @@ def is_due(player, entry, now, cfg):
         last = datetime.fromisoformat(entry["checked_at"])
     else:
         last = datetime.combine(date.fromisoformat(entry["checked"]), dtime(0, 0), tzinfo=TZ)
-    kind = "active" if player["state"] == "A" else "inactive"
     sec = cfg["schedule"]
+    if player["state"] == "R":  # retired: once a month, from retired_day on, in the night window, after the I players
+        if not in_time_window(now.time(), hhmm(sec["inactive_from"]), hhmm(sec["inactive_until"])):
+            return False
+        return now.day >= int(sec["retired_day"]) and (last.year, last.month) < (now.year, now.month)
+    kind = "active" if player["state"] == "A" else "inactive"
     if not in_time_window(now.time(), hhmm(sec[f"{kind}_from"]), hhmm(sec[f"{kind}_until"])):
         return False
     return now - last >= timedelta(hours=float(sec[f"{kind}_every_hours"])) - DUE_SLACK
@@ -928,18 +1036,21 @@ def main():
     wait_days, give_up_days = cfg.getint("results", "wait_days"), cfg.getint("results", "give_up_days")
     retry_hours, retry_other = cfg.getfloat("results", "retry_hours"), cfg.getfloat("results", "retry_other_hours")
     min_games, stable_hours = cfg.getint("results", "min_games"), cfg.getfloat("results", "stable_hours")
+    recheck_days = cfg.getint("results", "recheck_days")
 
     # Who is due now? Active players inside the active window every active_every_hours, inactive players inside the
     # inactive window every inactive_every_hours, new players immediately. Longest-waiting first, at most max_players_per_run.
     due = [p for p in players if is_due(p, data["players"].get(p["fide"]), now, cfg)]
-    due.sort(key=lambda p: (data["players"].get(p["fide"], {}).get("checked_at")
+    due.sort(key=lambda p: (1 if p["state"] == "R" else 0,  # retired players after the others
+                            data["players"].get(p["fide"], {}).get("checked_at")
                             or data["players"].get(p["fide"], {}).get("checked", ""), p["n"]))
     max_run = cfg.getint("requests", "max_players_per_run")
     selected = [] if args.rebuild else (due[:max_run] if max_run > 0 else due)
-    n_active = sum(1 for p in players if p["state"] == "A")
-    print(f"{len(players)} players ({n_active} active, {len(players) - n_active} inactive); "
+    count = lambda st: sum(1 for p in players if p["state"] == st)
+    print(f"{len(players)} players ({count('A')} active, {count('I')} inactive, {count('R')} retired); "
           f"{len(due)} due at {now.strftime('%H:%M')}, checking {len(selected)} in this run.")
-    waiting = result_candidates(data, now, wait_days, give_up_days)[0] if results_on and not args.rebuild else []
+    waiting = (result_candidates(data, now, wait_days, give_up_days)[0]
+               + recheck_candidates(data, now, recheck_days, give_up_days)) if results_on and not args.rebuild else []
     if not selected and not waiting and not args.rebuild:
         print("Nothing to do now.")
         return
@@ -986,6 +1097,21 @@ def main():
     withdraw_after = cfg.getint("feed", "withdraw_after_days")
     announce_initial = cfg.getboolean("feed", "announce_initial")
 
+    def reorder_new_items():
+        """Items found in this run get publication times one second apart, ordered by tournament date, so that
+        readers show the latest tournament on top."""
+        new = sorted((i for i in data["feed"] if i["id"] not in before_ids),
+                     key=lambda i: (i["start"], i["end"], i["tnr"], i["fide"]))
+        for idx, it in enumerate(new):
+            it["published"] = (now - timedelta(seconds=len(new) - 1 - idx)).isoformat()
+        return new
+
+    def save_progress():
+        """Called after every player and every result page: a stopped run keeps what it has already collected."""
+        reorder_new_items()
+        write_state(state_dir / "data.json", data)
+        log.save(log_hours)
+
     ok = failures = consecutive = 0
     aborted = None
     for n, player in enumerate(selected):
@@ -1014,24 +1140,29 @@ def main():
             result = f"ok - {counts['ongoing']} ongoing, {counts['upcoming']} upcoming, {counts['finished']} finished"
             print(f"player #{player['n']}: {result}")
             log.note(f"PLAYER | {fide_id} | {player['label'] or '-'} | {result}")
+            save_progress()
         except Blocked as e:
             aborted = f"blocked ({e}); skipping the rest of this run"
             print(f"player #{player['n']}: {aborted}", file=sys.stderr)
             log.note(f"PLAYER | {fide_id} | {player['label'] or '-'} | BLOCKED - {e}")
+            save_progress()
             break
         except SearchError as e:
             failures += 1
             consecutive += 1
             print(f"player #{player['n']}: FAILED - {e}", file=sys.stderr)
             log.note(f"PLAYER | {fide_id} | {player['label'] or '-'} | FAILED - {e}")
+            save_progress()
             if consecutive >= max_fail:
                 aborted = f"{consecutive} failures in a row; skipping the rest of this run"
                 print(aborted, file=sys.stderr)
                 break
 
-    # Results of finished tournaments: fetch the player's page once the tournament is over and final, check that the
-    # player really played, and only then announce. A few pages per run. A tournament whose results are not final yet
-    # is tried again after retry_hours; a page that cannot be read after retry_other_hours; after give_up_days: no more.
+    # Results of finished tournaments. Once a tournament is over and final, the player's page is fetched (a few per run),
+    # and only if the player really played is a result announced, with the tournament's and the player's data in its body.
+    # A tournament that is not final yet is tried again after retry_hours, a page that cannot be read after retry_other_hours.
+    # recheck_days after the end the page is read once more: if the player's results or stats changed, a correction is added.
+    # If chess-results stops answering, the page is simply tried again later, and everything collected so far is kept.
     if results_on and not args.rebuild and not aborted:
         by_fide = {p["fide"]: p for p in players}
         todo, gave_up = result_candidates(data, now, wait_days, give_up_days)
@@ -1039,16 +1170,21 @@ def main():
             if pair["fide"] in by_fide:
                 log.note(f"RESULT | {pair['fide']} | {by_fide[pair['fide']]['label'] or '-'} | tnr {pair['tnr']} | "
                          f"gave up (ended more than {give_up_days} days ago)")
-        todo = [pr for pr in todo if pr["fide"] in by_fide]
-        max_pages, k = cfg.getint("results", "max_per_run"), 0
-        for pair in todo:
-            nxt = pair.get("result_next")
+        work = [("result", pr) for pr in todo if pr["fide"] in by_fide]
+        work += [("recheck", pr) for pr in recheck_candidates(data, now, recheck_days, give_up_days)
+                 if pr["fide"] in by_fide]
+        max_pages, k, fail_streak = cfg.getint("results", "max_per_run"), 0, 0
+        for kind, pair in work:
+            nxt_key = "result_next" if kind == "result" else "recheck_next"
+            nxt = pair.get(nxt_key)
             if nxt and now < datetime.fromisoformat(nxt) - DUE_SLACK:
-                continue  # another player's page of the same tournament showed that it is not final yet
+                continue  # another page of the same tournament showed that it is not final yet
             if k >= max_pages:
                 break
             player = by_fide[pair["fide"]]
-            pair["result_tries"] = pair.get("result_tries", 0) + 1
+            if kind == "result":
+                pair["result_tries"] = pair.get("result_tries", 0) + 1
+            card = None
             try:
                 if args.cards_dir:
                     html = (Path(args.cards_dir) / f"{pair['tnr']}_{pair['snr']}.html").read_text(encoding="utf-8")
@@ -1065,32 +1201,52 @@ def main():
             except (SearchError, OSError) as e:
                 verdict = "fetch_failed"
                 print(f"result check #{k + 1}: FAILED - {e}", file=sys.stderr)
+            k += 1
+            fail_streak = fail_streak + 1 if verdict == "fetch_failed" else 0
+            hours = retry_hours if verdict in ("pending", "recent", "fetch_failed") else retry_other
+            retry_at = (clock() + timedelta(hours=hours)).isoformat(timespec="seconds")
             if verdict == "competed":
-                place = card["place"] if card["place"].isdigit() else (pair["rank"] if str(pair.get("rank", "")).isdigit() else "")
-                add_feed_item(data, "result", player, pair, now, extra={
-                    "points": card["points"], "place": place, "link": card_url(pair["tnr"], pair["snr"]),
-                    "finished": True})
-                pair["result"] = "announced"
-            elif verdict == "not_played":
+                details = {"t": card["tournament"], "p": card["player"]}
+                if kind == "result":
+                    place = card["place"] if card["place"].isdigit() else (pair["rank"] if str(pair.get("rank", "")).isdigit() else "")
+                    add_feed_item(data, "result", player, pair, now, extra={
+                        "points": card["points"], "place": place, "link": card_url(pair["tnr"], pair["snr"]),
+                        "finished": True, "details": details})
+                    pair["result"] = "announced"
+                    pair["announced_at"] = clock().isoformat(timespec="seconds")
+                    pair["snapshot"] = snapshot_of(card)
+                else:
+                    changes = diff_snapshots(pair["snapshot"], snapshot_of(card))
+                    if changes:
+                        add_feed_item(data, "correction", player, pair, now, extra={
+                            "points": card["points"], "place": card["place"], "link": card_url(pair["tnr"], pair["snr"]),
+                            "finished": True, "details": details, "changes": changes})
+                        pair["snapshot"] = snapshot_of(card)
+                        pair["recheck"] = "corrected"
+                    else:
+                        pair["recheck"] = "unchanged"
+            elif kind == "result" and verdict == "not_played":
                 pair["result"] = "not_played"
             else:
-                hours = retry_hours if verdict in ("pending", "recent") else retry_other
-                pair["result_next"] = (clock() + timedelta(hours=hours)).isoformat(timespec="seconds")
+                pair[nxt_key] = retry_at
                 if verdict == "recent":  # the tournament page changed lately: true for every player in it
                     for other in data["pairs"].values():
-                        if other["tnr"] == pair["tnr"] and not other.get("result") and other is not pair:
-                            other["result_next"] = pair["result_next"]
-            k += 1
-            print(f"result check #{k}: {verdict}")
+                        if other["tnr"] == pair["tnr"] and other is not pair and (
+                                (kind == "result" and not other.get("result")) or
+                                (kind == "recheck" and other.get("result") == "announced" and not other.get("recheck"))):
+                            other[nxt_key] = retry_at
+            print(f"result check #{k}: {kind} {verdict}")
             log.note(f"RESULT | {pair['fide']} | {player['label'] or '-'} | tnr {pair['tnr']} snr {pair['snr']} | "
-                     f"{verdict} (try {pair['result_tries']})")
+                     f"{kind} {verdict}" + (f" (try {pair['result_tries']})" if kind == "result" else ""))
+            save_progress()
+            if fail_streak >= 2:
+                print("chess-results is not answering; the remaining pages are left for the next run")
+                log.note("RESULT | chess-results is not answering; the remaining pages are left for the next run")
+                break
 
     # Items found in this run: give them publication times one second apart, ordered by tournament date,
     # so that readers show the latest tournament on top.
-    new_items = sorted((i for i in data["feed"] if i["id"] not in before_ids),
-                       key=lambda i: (i["start"], i["end"], i["tnr"], i["fide"]))
-    for idx, it in enumerate(new_items):
-        it["published"] = (now - timedelta(seconds=len(new_items) - 1 - idx)).isoformat()
+    new_items = reorder_new_items()
 
     prune(data, order, today, finished_days, cfg.getint("feed", "max_items"))
 
@@ -1120,7 +1276,7 @@ def main():
     ping = [base + f for f in sorted(new_files)] if new_items else []
 
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "data.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_state(state_dir / "data.json", data)
     (state_dir / "ping_urls.txt").write_text("\n".join(ping) + ("\n" if ping else ""), encoding="utf-8")
     log.note(f"RUN | {ok} ok, {failures} failed, {len(new_items)} new feed items"
              + (f", ABORTED: {aborted}" if aborted else ""))

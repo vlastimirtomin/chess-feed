@@ -840,6 +840,49 @@ def check_results(players, searcher, cfg, today, now, finished_days, upcoming_da
         print("RESULT: nothing to check.")
 
 
+def debug_card(searcher, tnr, snr):
+    """Diagnostic: how does a player page behave? Is the tournament data hidden, what does the 'show' button look
+    like, and what comes back when it is pressed? Prints structure only; changes nothing."""
+    from bs4 import BeautifulSoup
+
+    def describe(html):
+        card = parse_card(html, "")
+        return (f"{len(html)} characters, tournament details: {sorted(card['tournament']) or 'NONE'}, "
+                f"games found: {len(card['games'])}, 'show tournament data' text present: {bool(SHOW_BUTTON.search(html))}")
+
+    url = f"{searcher.base}/tnr{tnr}.aspx?lan={searcher.lan}&art=9&turdet=YES&snr={snr}"
+    searcher.ctx = ("card", "debug")
+    r = searcher._request("GET", url)
+    html = r.content.decode("utf-8", errors="replace")
+    print(f"GET  {url}\n     answered from {r.url}\n     {describe(html)}")
+    print(f"     cookies now: {sorted(searcher.session.cookies.keys()) or 'none'}")
+    form = BeautifulSoup(html, "html.parser").find("form")
+    if form is None:
+        print("     no <form> on the page, so no button to press")
+        return
+    fields = list_fields(form)
+    print(f"     form: method={form.get('method')}, action={form.get('action')}")
+    print(f"     hidden fields: {[n for n, k, _ in fields if k == 'hidden']}")
+    print(f"     buttons: {[(n, k, v) for n, k, v in fields if k in ('submit', 'button', 'image')]}")
+    button = next(((n, v) for n, k, v in fields if k in ("submit", "button") and SHOW_BUTTON.search(v or "")), None)
+    if button is None:
+        print("     no button with the 'show tournament data' text: nothing to press")
+        return
+    payload = {n: v for n, k, v in fields
+               if k not in ("submit", "button", "image", "reset", "file") and not (k in ("checkbox", "radio") and not v)}
+    payload[button[0]] = button[1]
+    time.sleep(2)
+    searcher.ctx = ("card-show", "debug")
+    try:
+        r2 = searcher._request("POST", urljoin(r.url, form.get("action") or r.url), data=payload)
+    except SearchError as e:
+        print(f"POST pressing {button[0]!r}: FAILED - {e}")
+        return
+    html2 = r2.content.decode("utf-8", errors="replace")
+    print(f"POST pressing {button[0]!r}\n     answered from {r2.url}\n     {describe(html2)}")
+    print(f"     cookies now: {sorted(searcher.session.cookies.keys()) or 'none'}")
+
+
 def explain_player(p, searcher, cfg, today, now, finished_days, upcoming_days, window, pause, data, count=3):
     """Diagnostic for ONE player: every tournament in the window, whether the result check would pick it up,
     and if not, why. Opens at most `count` player pages. Changes nothing."""
@@ -979,6 +1022,7 @@ def main():
     ap.add_argument("--websub-ping", action="store_true")
     ap.add_argument("--check-results", action="store_true",
                     help="show what the script reads from the player pages of up to 3 finished tournaments")
+    ap.add_argument("--debug-card", default="", help="with --check-results: TNR:SNR, show how that player page behaves")
     ap.add_argument("--only-fide", default="", help="with --check-results: explain this one player in detail")
     ap.add_argument("--cards-dir", help="testing: read player pages from DIR/TNR_SNR.html instead of the site")
     ap.add_argument("--rebuild", action="store_true",
@@ -1064,6 +1108,12 @@ def main():
     if args.check_results:
         if searcher is None:
             sys.exit("--check-results needs network access")
+        if args.debug_card.strip():
+            tnr_, _, snr_ = args.debug_card.strip().partition(":")
+            if not (tnr_.isdigit() and snr_.isdigit()):
+                sys.exit("--debug-card needs TNR:SNR, for example 1515259:19")
+            debug_card(searcher, tnr_, snr_)
+            return
         cr_players = load_players(args.players, load_groups(cfg), default_groups)
         searcher.names = {p["fide"]: p["label"] for p in cr_players}
         only = args.only_fide.strip()

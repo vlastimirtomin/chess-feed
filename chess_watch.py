@@ -102,7 +102,7 @@ def file_part(text, what):
 
 
 def load_groups(cfg):
-    """[groups]  1 = kikinda | Title   ->  {"1": {"file": "kikinda", "title": "Title"}}"""
+    """[groups]  1 = GROUP | Title   ->  {"1": {"file": "GROUP", "title": "Title"}}"""
     groups, used = {}, set()
     for key, value in cfg.items("groups"):
         if not key.isdigit():

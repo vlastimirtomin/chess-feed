@@ -17,6 +17,11 @@ on:
         type: string
         required: false
         default: ""
+      card:
+        description: "only for check-results: TNR:SNR of one player page to examine (for example 1515259:19)"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write   # only for the small keep-alive commit at the end
@@ -76,7 +81,7 @@ jobs:
 
       - name: Check the reading of results pages
         if: ${{ github.event.inputs.mode == 'check-results' }}
-        run: python chess_watch.py --check-results --only-fide "${{ github.event.inputs.fide }}" --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
+        run: python chess_watch.py --check-results --only-fide "${{ github.event.inputs.fide }}" --debug-card "${{ github.event.inputs.card }}" --config data/config.ini --players data/players.txt --state-dir data/state --contact "https://github.com/${{ github.repository }}"
 
       - name: Rebuild the feeds (no player is checked)
         if: ${{ github.event.inputs.mode == 'rebuild' }}

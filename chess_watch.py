@@ -296,11 +296,37 @@ class Searcher:
         raise NotExcel("response was not an Excel file (saved as debug_response.html)")
 
 
+SHOW_BUTTON = re.compile(r"податке о турниру|tournament data|tournament details|Turnierdaten", re.I)
+
+
 def _fetch_card(self, tnr, snr, ident):
-    """Plain GET of one player's page in one tournament (art=9)."""
+    """GET of one player's page in one tournament (art=9). For older tournaments the site hides the tournament
+    details (and the links) behind a button; then the button is pressed once, which is one more request."""
+    from bs4 import BeautifulSoup
+
     self.ctx = ("card", ident)
     r = self._request("GET", f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&turdet=YES&snr={snr}")
-    return r.content.decode("utf-8", errors="replace")
+    html = r.content.decode("utf-8", errors="replace")
+    if not SHOW_BUTTON.search(html):
+        return html
+    form = BeautifulSoup(html, "html.parser").find("form")
+    if form is None:
+        return html
+    fields = list_fields(form)
+    button = next(((n, v) for n, k, v in fields if k in ("submit", "button") and SHOW_BUTTON.search(v or "")), None)
+    if button is None:
+        return html
+    payload = {n: v for n, k, v in fields
+               if k not in ("submit", "button", "image", "reset", "file") and not (k in ("checkbox", "radio") and not v)}
+    payload[button[0]] = button[1]
+    time.sleep(2)
+    self.ctx = ("card-show", ident)
+    try:
+        r2 = self._request("POST", urljoin(r.url, form.get("action") or r.url), data=payload)
+    except SearchError:
+        return html  # keep the page we have (a block still stops the run: Blocked is not caught here)
+    html2 = r2.content.decode("utf-8", errors="replace")
+    return html2 if not SHOW_BUTTON.search(html2) or len(html2) > len(html) else html
 
 
 Searcher.fetch_card = _fetch_card
@@ -617,10 +643,13 @@ def parse_card(html, fide_id):
             break
     games = []
     for tr in soup.find_all("tr"):
-        if not tr.find("a", href=OPPONENT_LINK):
-            continue
         cells = tr.find_all("td", recursive=False)
         if len(cells) < 4 or not clean(cells[0].get_text(" ")).isdigit():
+            continue
+        # A game row has the opponent's starting rank (3rd cell) as a number; a bye has none. The opponent's name is
+        # a link only while the site shows links (it hides them for older tournaments), so a link is not required.
+        sno = clean(cells[2].get_text(" "))
+        if not (sno.isdigit() and int(sno) > 0) and not tr.find("a", href=OPPONENT_LINK):
             continue
         nested = [c for c in cells if c.find("table")]
         if nested:
@@ -803,7 +832,8 @@ def check_results(players, searcher, cfg, today, now, finished_days, upcoming_da
               f"   games found: {len(card['games'])}, really played: {played}, results: "
               f"{[g['result'] for g in card['games']]}\n"
               f"   points on the page: {card['points'] or '?'}, place: {card['place'] or '?'}, "
-              f"FIDE ID found on the page: {card['identity_ok']}, page last changed: {card['last_update'] or '?'}\n"
+              f"FIDE ID found on the page: {card['identity_ok']}, page last changed: {card['last_update'] or '?'}, "
+              f"tournament data found: {bool(card['tournament'])}\n"
               f"   verdict: {verdict}\n   compare with: {card_url(r['tnr'], r['snr'])}")
         shown += 1
     if not shown:
@@ -845,7 +875,8 @@ def explain_player(p, searcher, cfg, today, now, finished_days, upcoming_days, w
             print(f"    opened the player's page: games found {len(card['games'])}, really played {played}, results "
                   f"{[g['result'] for g in card['games']]}\n"
                   f"    points on the page: {card['points'] or '?'}, place: {card['place'] or '?'}, FIDE ID on the page: "
-                  f"{card['identity_ok']}, page last changed: {card['last_update'] or '?'}\n"
+                  f"{card['identity_ok']}, page last changed: {card['last_update'] or '?'}, "
+                  f"tournament data found: {bool(card['tournament'])}\n"
                   f"    verdict: {verdict}   link: {card_url(r['tnr'], r['snr'])}")
         else:
             print("    eligible (page not opened here: limit of pages for this check)")
@@ -1306,7 +1337,11 @@ def main():
             hours = retry_hours if verdict in ("pending", "recent", "fetch_failed") else retry_other
             retry_at = (clock() + timedelta(hours=hours)).isoformat(timespec="seconds")
             if verdict == "competed":
-                details = {"t": card["tournament"], "p": card["player"]}
+                tour = card["tournament"]
+                if not tour:  # the site hid the details: use what was read at sign-up time, without the average
+                    tour = {k: v for k, v in data.get("tournaments", {}).get(pair["tnr"], {}).get("t", {}).items()
+                            if k != "avg"}
+                details = {"t": tour, "p": card["player"]}
                 if kind == "result":
                     place = card["place"] if card["place"].isdigit() else (pair["rank"] if str(pair.get("rank", "")).isdigit() else "")
                     add_feed_item(data, "result", player, pair, now, extra={

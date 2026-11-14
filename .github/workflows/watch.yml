@@ -2,9 +2,9 @@ name: Update tournaments
 
 on:
   schedule:
-    # Six runs a day at fixed UTC times. The script decides who is due, so most runs are short.
-    # In Serbia this is 01:17, 05:17, 09:17, 13:17, 17:17, 21:17 in winter (one hour later in summer).
-    - cron: "17 0,4,8,12,16,20 * * *"
+    # Twelve runs a day, every 2 hours at fixed UTC times. The script decides who is due, so many runs are short.
+    # In Serbia this is 01:17, 03:17, 05:17 ... 23:17 in winter (one hour later in summer).
+    - cron: "17 */2 * * *"
   workflow_dispatch:
     inputs:
       mode:

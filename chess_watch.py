@@ -194,6 +194,7 @@ class Searcher:
         self.newest_first = newest_first
         self.names = {}           # FIDE ID -> label, only used to make the private log readable
         self.show_gave_up = False  # pressing "show tournament data" did not help in this run: do not try again
+        self.card_base = None      # the server node (for example https://S3.chess-results.com) that answered the last player page
         self.date_fields = None   # (from-field, to-field) of the "tournament end between" filter
         self.last_filtered = False
         self.action = None
@@ -335,31 +336,47 @@ def press_show_control(self, r, form, control):
     return r2.content.decode("utf-8", errors="replace")
 
 
+MAX_PRESSES = 3  # by hand it sometimes takes two or three clicks before the tournament data shows
+
+
 def _fetch_card(self, tnr, snr, ident):
     """GET of one player's page in one tournament (art=9). For older tournaments the site hides the tournament
-    details (and the links) behind a control. It is pressed, and the page is loaded once more because the server may
-    apply the choice only on the next load. If that does not help, nothing more is tried for the rest of the run."""
+    details (and the links) behind a control. Like a visitor, the script presses it, up to MAX_PRESSES times, always
+    on the same server node (the session cookie belongs to that node), reloading the page after each press. Once
+    it works, later pages of the same run show the details at once. If it does not work, nothing more is tried
+    for the rest of the run."""
     from bs4 import BeautifulSoup
+    from urllib.parse import urlparse
 
-    url = f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&turdet=YES&snr={snr}"
+    path = f"/tnr{tnr}.aspx?lan={self.lan}&art=9&turdet=YES&snr={snr}"
     self.ctx = ("card", ident)
-    r = self._request("GET", url)
+    try:
+        r = self._request("GET", (self.card_base or self.base) + path)
+    except SearchError:
+        self.card_base = None  # the node did not answer: start from the main address next time
+        raise
+    u = urlparse(r.url)
+    self.card_base = f"{u.scheme}://{u.netloc}"  # stay on this node: its session remembers what was pressed
     html = r.content.decode("utf-8", errors="replace")
     if parse_card(html, "")["tournament"] or self.show_gave_up:
         return html  # the details are there already (or pressing the control is known not to help)
-    form, control = find_show_control(BeautifulSoup(html, "html.parser"))
-    if form is None or control is None:
-        return html
-    html2 = press_show_control(self, r, form, control)
-    if html2 is not None and parse_card(html2, "")["tournament"]:
-        return html2
-    self.ctx = ("card", ident)
-    r3 = self._request("GET", url)
-    html3 = r3.content.decode("utf-8", errors="replace")
-    if parse_card(html3, "")["tournament"]:
-        return html3
+    first, page = html, r
+    for _ in range(MAX_PRESSES):
+        form, control = find_show_control(BeautifulSoup(html, "html.parser"))
+        if form is None or control is None:
+            break
+        html2 = press_show_control(self, page, form, control)
+        if html2 is None:
+            break
+        if parse_card(html2, "")["tournament"]:
+            return html2
+        self.ctx = ("card", ident)
+        page = self._request("GET", self.card_base + path)  # the choice may apply from the next load on
+        html = page.content.decode("utf-8", errors="replace")
+        if parse_card(html, "")["tournament"]:
+            return html
     self.show_gave_up = True
-    return html
+    return first
 
 
 Searcher.press_show_control = press_show_control
@@ -921,17 +938,38 @@ def debug_card(searcher, tnr, snr):
         print("     no control to show the tournament data was found: nothing to press")
         return
     print(f"     control found: {control}")
-    html2 = searcher.press_show_control(r, form, control)
-    if html2 is None:
-        print("POST pressing it: FAILED")
-        return
-    print("POST after pressing it")
-    describe(html2)
+    from urllib.parse import urlparse
+
+    u = urlparse(r.url)
+    node = f"{u.scheme}://{u.netloc}"
+    path = f"/tnr{tnr}.aspx?lan={searcher.lan}&art=9&turdet=YES&snr={snr}"
+    short = lambda h: (f"tournament details: {sorted(parse_card(h, '')['tournament']) or 'NONE'}; "
+                       f"games found: {len(parse_card(h, '')['games'])}; 'show' text present: "
+                       f"{bool(SHOW_BUTTON.search(clean(BeautifulSoup(h, 'html.parser').get_text(' '))))}")
+    page, cur = r, html
+    for n in range(1, MAX_PRESSES + 1):
+        form, control = find_show_control(BeautifulSoup(cur, "html.parser"))
+        if form is None or control is None:
+            print(f"press {n}: no control any more")
+            break
+        searcher.ctx = ("card-show", "debug")
+        html2 = searcher.press_show_control(page, form, control)
+        if html2 is None:
+            print(f"press {n}: FAILED")
+            return
+        print(f"press {n} (POST to the same server {node}): {short(html2)}")
+        if parse_card(html2, "")["tournament"]:
+            print("     => the tournament details came with the answer to the press")
+            return
+        searcher.ctx = ("card", "debug")
+        page = searcher._request("GET", node + path)
+        cur = page.content.decode("utf-8", errors="replace")
+        print(f"     page loaded again from {page.url}: {short(cur)}")
+        if parse_card(cur, "")["tournament"]:
+            print("     => the tournament details showed after the reload")
+            return
     print(f"     cookies now: {sorted(searcher.session.cookies.keys()) or 'none'}")
-    searcher.ctx = ("card", "debug")
-    r3 = searcher._request("GET", url)
-    print(f"GET again after pressing it (status {r3.status_code}, answered from {r3.url})")
-    describe(r3.content.decode("utf-8", errors="replace"))
+    print("     => the tournament details did not show")
 
 
 def explain_player(p, searcher, cfg, today, now, finished_days, upcoming_days, window, pause, data, count=3):

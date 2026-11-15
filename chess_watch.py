@@ -193,6 +193,7 @@ class Searcher:
         self.fide_field, self.excel_button = fide_field, excel_button
         self.newest_first = newest_first
         self.names = {}           # FIDE ID -> label, only used to make the private log readable
+        self.show_gave_up = False  # pressing "show tournament data" did not help in this run: do not try again
         self.date_fields = None   # (from-field, to-field) of the "tournament end between" filter
         self.last_filtered = False
         self.action = None
@@ -336,20 +337,28 @@ def press_show_control(self, r, form, control):
 
 def _fetch_card(self, tnr, snr, ident):
     """GET of one player's page in one tournament (art=9). For older tournaments the site hides the tournament
-    details (and the links) behind a control; then it is pressed once, which is one more request."""
+    details (and the links) behind a control. It is pressed, and the page is loaded once more because the server may
+    apply the choice only on the next load. If that does not help, nothing more is tried for the rest of the run."""
     from bs4 import BeautifulSoup
 
+    url = f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&turdet=YES&snr={snr}"
     self.ctx = ("card", ident)
-    r = self._request("GET", f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&turdet=YES&snr={snr}")
+    r = self._request("GET", url)
     html = r.content.decode("utf-8", errors="replace")
-    if parse_card(html, "")["tournament"]:
-        return html  # the details are there already
+    if parse_card(html, "")["tournament"] or self.show_gave_up:
+        return html  # the details are there already (or pressing the control is known not to help)
     form, control = find_show_control(BeautifulSoup(html, "html.parser"))
     if form is None or control is None:
         return html
     html2 = press_show_control(self, r, form, control)
     if html2 is not None and parse_card(html2, "")["tournament"]:
         return html2
+    self.ctx = ("card", ident)
+    r3 = self._request("GET", url)
+    html3 = r3.content.decode("utf-8", errors="replace")
+    if parse_card(html3, "")["tournament"]:
+        return html3
+    self.show_gave_up = True
     return html
 
 
@@ -919,6 +928,10 @@ def debug_card(searcher, tnr, snr):
     print("POST after pressing it")
     describe(html2)
     print(f"     cookies now: {sorted(searcher.session.cookies.keys()) or 'none'}")
+    searcher.ctx = ("card", "debug")
+    r3 = searcher._request("GET", url)
+    print(f"GET again after pressing it (status {r3.status_code}, answered from {r3.url})")
+    describe(r3.content.decode("utf-8", errors="replace"))
 
 
 def explain_player(p, searcher, cfg, today, now, finished_days, upcoming_days, window, pause, data, count=3):
@@ -1412,6 +1425,9 @@ def main():
                     flags["requests"] = True
                     html = searcher.fetch_card(pair["tnr"], pair["snr"], f"{pair['fide']} {player['label']}".strip())
                 card = parse_card(html, pair["fide"])
+                if card["tournament"]:  # remember it: older pages of this tournament may hide it
+                    data.setdefault("tournaments", {})[pair["tnr"]] = {
+                        "t": card["tournament"], "at": today.isoformat(), "final": pair["end"] < today.isoformat()}
                 verdict = classify_card(card, now, min_games, stable_hours)
             except Blocked as e:
                 aborted = f"blocked ({e}); skipping the rest of this run"
@@ -1426,9 +1442,9 @@ def main():
             retry_at = (clock() + timedelta(hours=hours)).isoformat(timespec="seconds")
             if verdict == "competed":
                 tour = card["tournament"]
-                if not tour:  # the site hid the details: use what was read at sign-up time, without the average
-                    tour = {k: v for k, v in data.get("tournaments", {}).get(pair["tnr"], {}).get("t", {}).items()
-                            if k != "avg"}
+                if not tour:  # the site hid the details: use what was saved earlier; the average only if it was final
+                    cached = data.get("tournaments", {}).get(pair["tnr"], {})
+                    tour = {k: v for k, v in cached.get("t", {}).items() if cached.get("final") or k != "avg"}
                 details = {"t": tour, "p": card["player"]}
                 if kind == "result":
                     place = card["place"] if card["place"].isdigit() else (pair["rank"] if str(pair.get("rank", "")).isdigit() else "")

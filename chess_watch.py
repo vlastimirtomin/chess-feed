@@ -297,38 +297,63 @@ class Searcher:
 
 
 SHOW_BUTTON = re.compile(r"податке о турниру|tournament data|tournament details|Turnierdaten", re.I)
+POSTBACK = re.compile(r"__doPostBack\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)")
+
+
+def find_show_control(soup):
+    """The control that shows the tournament data on older tournaments: a submit button, or a link that posts back.
+    Returns (form, ("button", name, value) | ("link", target, argument) | None)."""
+    form = soup.find("form")
+    for el in soup.find_all(["input", "button"]):
+        v = el.get("value") or el.get_text(" ")
+        if el.get("name") and (el.get("type") or "").lower() in ("submit", "button", "image", "") and SHOW_BUTTON.search(v or ""):
+            return form, ("button", el["name"], el.get("value", ""))
+    for a in soup.find_all("a"):
+        if SHOW_BUTTON.search(a.get_text(" ")):
+            m = POSTBACK.search((a.get("href") or "") + " " + (a.get("onclick") or ""))
+            if m:
+                return form, ("link", m.group(1), m.group(2))
+    return form, None
+
+
+def press_show_control(self, r, form, control):
+    """Press the control found above; returns the new page text, or None if that did not work."""
+    fields = list_fields(form)
+    payload = {n: v for n, k, v in fields
+               if k not in ("submit", "button", "image", "reset", "file") and not (k in ("checkbox", "radio") and not v)}
+    if control[0] == "button":
+        payload[control[1]] = control[2]
+    else:
+        payload["__EVENTTARGET"], payload["__EVENTARGUMENT"] = control[1], control[2]
+    time.sleep(2)
+    self.ctx = ("card-show", self.ctx[1])
+    try:
+        r2 = self._request("POST", urljoin(r.url, form.get("action") or r.url), data=payload)
+    except SearchError:
+        return None  # a block still stops the run: Blocked is not caught here
+    return r2.content.decode("utf-8", errors="replace")
 
 
 def _fetch_card(self, tnr, snr, ident):
     """GET of one player's page in one tournament (art=9). For older tournaments the site hides the tournament
-    details (and the links) behind a button; then the button is pressed once, which is one more request."""
+    details (and the links) behind a control; then it is pressed once, which is one more request."""
     from bs4 import BeautifulSoup
 
     self.ctx = ("card", ident)
     r = self._request("GET", f"{self.base}/tnr{tnr}.aspx?lan={self.lan}&art=9&turdet=YES&snr={snr}")
     html = r.content.decode("utf-8", errors="replace")
-    if not SHOW_BUTTON.search(html):
+    if parse_card(html, "")["tournament"]:
+        return html  # the details are there already
+    form, control = find_show_control(BeautifulSoup(html, "html.parser"))
+    if form is None or control is None:
         return html
-    form = BeautifulSoup(html, "html.parser").find("form")
-    if form is None:
-        return html
-    fields = list_fields(form)
-    button = next(((n, v) for n, k, v in fields if k in ("submit", "button") and SHOW_BUTTON.search(v or "")), None)
-    if button is None:
-        return html
-    payload = {n: v for n, k, v in fields
-               if k not in ("submit", "button", "image", "reset", "file") and not (k in ("checkbox", "radio") and not v)}
-    payload[button[0]] = button[1]
-    time.sleep(2)
-    self.ctx = ("card-show", ident)
-    try:
-        r2 = self._request("POST", urljoin(r.url, form.get("action") or r.url), data=payload)
-    except SearchError:
-        return html  # keep the page we have (a block still stops the run: Blocked is not caught here)
-    html2 = r2.content.decode("utf-8", errors="replace")
-    return html2 if not SHOW_BUTTON.search(html2) or len(html2) > len(html) else html
+    html2 = press_show_control(self, r, form, control)
+    if html2 is not None and parse_card(html2, "")["tournament"]:
+        return html2
+    return html
 
 
+Searcher.press_show_control = press_show_control
 Searcher.fetch_card = _fetch_card
 
 
@@ -841,45 +866,58 @@ def check_results(players, searcher, cfg, today, now, finished_days, upcoming_da
 
 
 def debug_card(searcher, tnr, snr):
-    """Diagnostic: how does a player page behave? Is the tournament data hidden, what does the 'show' button look
-    like, and what comes back when it is pressed? Prints structure only; changes nothing."""
+    """Diagnostic: how does a player page behave? Is the tournament data there, is it hidden, what is the control that
+    shows it, and what comes back when it is pressed? Prints structure and some visible text; changes nothing."""
     from bs4 import BeautifulSoup
 
+    clean = lambda t: re.sub(r"\s+", " ", t.replace("\xa0", " ")).strip()
+
     def describe(html):
+        soup = BeautifulSoup(html, "html.parser")
         card = parse_card(html, "")
-        return (f"{len(html)} characters, tournament details: {sorted(card['tournament']) or 'NONE'}, "
-                f"games found: {len(card['games'])}, 'show tournament data' text present: {bool(SHOW_BUTTON.search(html))}")
+        labels = []
+        for tr in soup.find_all("tr"):
+            cells = tr.find_all(["td", "th"], recursive=False)
+            if len(cells) == 2 and clean(cells[0].get_text(" ")):
+                labels.append(clean(cells[0].get_text(" "))[:40])
+        text = clean(soup.get_text(" "))
+        print(f"     {len(html)} characters; escaped letters (&#...) in the source: {html.count('&#')}; games found: {len(card['games'])}")
+        print(f"     tournament details found: {sorted(card['tournament']) or 'NONE'}")
+        print(f"     labels of two-column rows: {labels[:30]}")
+        print(f"     'show tournament data' text on the page: {bool(SHOW_BUTTON.search(text))}; "
+              f"the word 'Нота' on the page: {'Нота' in text}")
+        for el in soup.find_all(string=SHOW_BUTTON)[:3]:
+            par = el.parent
+            print(f"     the text sits in <{par.name}> with attributes {dict(par.attrs)}; "
+                  f"inside <{par.parent.name if par.parent else '?'}> {dict(par.parent.attrs) if par.parent else ''}")
+        print(f"     links that post back: {[(clean(a.get_text(' '))[:30], (a.get('href') or '')[:70]) for a in soup.find_all('a') if POSTBACK.search((a.get('href') or '') + (a.get('onclick') or ''))][:5]}")
+        print(f"     text near the top: {text[:300]!r}")
+        return soup
 
     url = f"{searcher.base}/tnr{tnr}.aspx?lan={searcher.lan}&art=9&turdet=YES&snr={snr}"
     searcher.ctx = ("card", "debug")
     r = searcher._request("GET", url)
     html = r.content.decode("utf-8", errors="replace")
-    print(f"GET  {url}\n     answered from {r.url}\n     {describe(html)}")
+    print(f"GET  {url}\n     answered from {r.url}")
+    soup = describe(html)
     print(f"     cookies now: {sorted(searcher.session.cookies.keys()) or 'none'}")
-    form = BeautifulSoup(html, "html.parser").find("form")
+    form, control = find_show_control(soup)
     if form is None:
-        print("     no <form> on the page, so no button to press")
+        print("     no <form> on the page")
         return
     fields = list_fields(form)
-    print(f"     form: method={form.get('method')}, action={form.get('action')}")
-    print(f"     hidden fields: {[n for n, k, _ in fields if k == 'hidden']}")
-    print(f"     buttons: {[(n, k, v) for n, k, v in fields if k in ('submit', 'button', 'image')]}")
-    button = next(((n, v) for n, k, v in fields if k in ("submit", "button") and SHOW_BUTTON.search(v or "")), None)
-    if button is None:
-        print("     no button with the 'show tournament data' text: nothing to press")
+    print(f"     form: method={form.get('method')}, action={form.get('action')}; hidden fields: "
+          f"{[n for n, k, _ in fields if k == 'hidden']}; buttons: {[(n, k, v) for n, k, v in fields if k in ('submit', 'button', 'image')]}")
+    if control is None:
+        print("     no control to show the tournament data was found: nothing to press")
         return
-    payload = {n: v for n, k, v in fields
-               if k not in ("submit", "button", "image", "reset", "file") and not (k in ("checkbox", "radio") and not v)}
-    payload[button[0]] = button[1]
-    time.sleep(2)
-    searcher.ctx = ("card-show", "debug")
-    try:
-        r2 = searcher._request("POST", urljoin(r.url, form.get("action") or r.url), data=payload)
-    except SearchError as e:
-        print(f"POST pressing {button[0]!r}: FAILED - {e}")
+    print(f"     control found: {control}")
+    html2 = searcher.press_show_control(r, form, control)
+    if html2 is None:
+        print("POST pressing it: FAILED")
         return
-    html2 = r2.content.decode("utf-8", errors="replace")
-    print(f"POST pressing {button[0]!r}\n     answered from {r2.url}\n     {describe(html2)}")
+    print("POST after pressing it")
+    describe(html2)
     print(f"     cookies now: {sorted(searcher.session.cookies.keys()) or 'none'}")
 
 

@@ -575,6 +575,9 @@ def prune(data, order, today, finished_days, max_items):
     lo = (today - timedelta(days=finished_days)).isoformat()
     data["pairs"] = {k: p for k, p in data.get("pairs", {}).items() if p["fide"] in order and p["end"] >= lo}
     data["feed"] = sorted(data.get("feed", []), key=lambda i: (i["published"], i["id"]))[-max_items:]
+    # saved tournament data is only needed while the tournament is inside the window (plus a month of margin)
+    keep = (today - timedelta(days=finished_days + 30)).isoformat()
+    data["tournaments"] = {k: v for k, v in data.get("tournaments", {}).items() if v.get("at", "9999") >= keep}
 
 
 # ---------------------------------------------------------------- feed (Serbian Cyrillic)

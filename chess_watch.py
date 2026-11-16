@@ -61,7 +61,7 @@ DEFAULTS = {
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
     "groups": {"default": ""},
     "details": {"enabled": "yes", "max_per_run": "10", "wait_hours": "12", "cache_days": "2",
-                "join_hide_average": "yes"},
+                "join_hide_average": "yes", "max_presses": "6"},
     "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "retry_hours": "4",
                 "retry_other_hours": "24", "give_up_days": "7", "recheck_days": "3", "max_per_run": "3",
                 "min_games": "1"},
@@ -194,6 +194,7 @@ class Searcher:
         self.newest_first = newest_first
         self.names = {}           # FIDE ID -> label, only used to make the private log readable
         self.show_gave_up = False  # pressing "show tournament data" did not help in this run: do not try again
+        self.max_presses = 6       # how often "show tournament data" is pressed before giving up in a run
         self.card_base = None      # the server node (for example https://S3.chess-results.com) that answered the last player page
         self.date_fields = None   # (from-field, to-field) of the "tournament end between" filter
         self.last_filtered = False
@@ -329,17 +330,21 @@ def press_show_control(self, r, form, control):
         payload["__EVENTTARGET"], payload["__EVENTARGUMENT"] = control[1], control[2]
     time.sleep(2)
     self.ctx = ("card-show", self.ctx[1])
+    from urllib.parse import urlparse
+
+    u = urlparse(r.url)
     try:
-        r2 = self._request("POST", urljoin(r.url, form.get("action") or r.url), data=payload)
+        r2 = self._request("POST", urljoin(r.url, form.get("action") or r.url), data=payload,
+                           headers={"Referer": r.url, "Origin": f"{u.scheme}://{u.netloc}"})
     except SearchError:
         return None  # a block still stops the run: Blocked is not caught here
     return r2.content.decode("utf-8", errors="replace")
 
 
-MAX_PRESSES = 3  # by hand it sometimes takes two or three clicks before the tournament data shows
+MAX_PRESSES = 8  # used by the diagnostic only; by hand it sometimes takes several clicks before the data shows
 
 
-def _fetch_card(self, tnr, snr, ident):
+def _fetch_card(self, tnr, snr, ident, want_details=True):
     """GET of one player's page in one tournament (art=9). For older tournaments the site hides the tournament
     details (and the links) behind a control. Like a visitor, the script presses it, up to MAX_PRESSES times, always
     on the same server node (the session cookie belongs to that node), reloading the page after each press. Once
@@ -358,10 +363,10 @@ def _fetch_card(self, tnr, snr, ident):
     u = urlparse(r.url)
     self.card_base = f"{u.scheme}://{u.netloc}"  # stay on this node: its session remembers what was pressed
     html = r.content.decode("utf-8", errors="replace")
-    if parse_card(html, "")["tournament"] or self.show_gave_up:
-        return html  # the details are there already (or pressing the control is known not to help)
+    if parse_card(html, "")["tournament"] or self.show_gave_up or not want_details:
+        return html  # the details are there already (or not needed, or pressing is known not to help)
     first, page = html, r
-    for _ in range(MAX_PRESSES):
+    for _ in range(self.max_presses):
         form, control = find_show_control(BeautifulSoup(html, "html.parser"))
         if form is None or control is None:
             break
@@ -1153,6 +1158,7 @@ def main():
         session.headers["User-Agent"] = ua + (f"; {args.contact})" if args.contact else ")")
         searcher = Searcher(session, args.base, LAN, log, args.fide_field, args.excel_button,
                             newest_first=cfg.getboolean("requests", "newest_first_sort"))
+        searcher.max_presses = cfg.getint("details", "max_presses")
 
     if args.discover:
         if searcher is None:
@@ -1461,7 +1467,9 @@ def main():
                     if k or flags["requests"]:
                         pause()
                     flags["requests"] = True
-                    html = searcher.fetch_card(pair["tnr"], pair["snr"], f"{pair['fide']} {player['label']}".strip())
+                    saved = data.get("tournaments", {}).get(pair["tnr"], {})
+                    html = searcher.fetch_card(pair["tnr"], pair["snr"], f"{pair['fide']} {player['label']}".strip(),
+                                               want_details=not (saved.get("t") and saved.get("final")))
                 card = parse_card(html, pair["fide"])
                 if card["tournament"]:  # remember it: older pages of this tournament may hide it
                     data.setdefault("tournaments", {})[pair["tnr"]] = {

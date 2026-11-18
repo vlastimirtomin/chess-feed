@@ -119,6 +119,25 @@ jobs:
             git push
           fi
 
+      - name: Squash the history of the private repository (every few weeks)
+        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && github.event.inputs.mode != 'check-results' }}
+        run: |
+          # The private repo keeps every earlier version of the state files; they are of no use. Every squash_days days
+          # (config.ini, section [history]) the whole history is replaced by one commit. 0 = never.
+          DAYS=$(python chess_watch.py --config data/config.ini --get history.squash_days)
+          if [ "${DAYS:-0}" -le 0 ]; then echo "Squashing the history is switched off."; exit 0; fi
+          cd data
+          if git log --since="${DAYS} days ago" --format=%s | grep -qx "Squash history"; then
+            echo "The history was squashed less than ${DAYS} days ago."; exit 0
+          fi
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git config user.name "chess-watch bot"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout --orphan "squashed-$$"
+          git add -A
+          git commit -m "Squash history"
+          git push --force origin "HEAD:${BRANCH}" || echo "::warning::Could not squash the history (is the branch protected?)"
+
       - name: Keep scheduled runs alive
         if: ${{ always() }}
         run: |

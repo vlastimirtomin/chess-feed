@@ -60,6 +60,7 @@ DEFAULTS = {
     "feed": {"player_prefix": "fide", "player_title": "Турнири: {label} - {fide}",
              "withdraw_after_days": "3", "max_items": "300", "announce_initial": "yes"},
     "groups": {"default": ""},
+    "history": {"squash_days": "28"},
     "details": {"enabled": "yes", "max_per_run": "10", "wait_hours": "12", "cache_days": "2",
                 "join_hide_average": "yes", "max_presses": "0"},
     "results": {"enabled": "no", "wait_days": "2", "stable_hours": "24", "retry_hours": "4",
@@ -1116,6 +1117,7 @@ def main():
     ap.add_argument("--check-filter", action="store_true",
                     help="compare filtered and unfiltered searches for the first 3 players")
     ap.add_argument("--export-env", action="store_true", help="print FEED_REPO and SITE_URL for the workflow")
+    ap.add_argument("--get", default="", help="print one setting, for example history.squash_days (for the workflow)")
     ap.add_argument("--websub-ping", action="store_true")
     ap.add_argument("--check-results", action="store_true",
                     help="show what the script reads from the player pages of up to 3 finished tournaments")
@@ -1143,6 +1145,11 @@ def main():
         TZ = _ZI(cfg.get("schedule", "timezone").strip())
     except Exception:
         pass  # keep the default
+
+    if args.get:
+        section, _, key = args.get.partition(".")
+        print(cfg.get(section, key))
+        return
 
     if args.export_env:
         print(f"FEED_REPO={cfg.get('publish', 'feed_repo').strip()}")

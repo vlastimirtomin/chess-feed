@@ -70,7 +70,7 @@ DEFAULTS = {
                "wait_seconds": "90"},
     "schedule": {"timezone": "Europe/Belgrade", "active_from": "05:00", "active_until": "01:00",
                  "inactive_from": "01:00", "inactive_until": "05:00",
-                 "active_every_hours": "4", "inactive_every_hours": "20", "retired_day": "1"},
+                 "active_every_hours": "4", "inactive_every_hours": "20", "retired_weekday": "Monday"},
     "publish": {"feed_repo": ""},
     "log": {"hours": "48"},
 }
@@ -1045,6 +1045,19 @@ def in_time_window(t, start, end):
     return start <= t < end if start <= end else (t >= start or t < end)
 
 
+WEEKDAYS = {"monday": 0, "mon": 0, "1": 0, "ponedeljak": 0, "tuesday": 1, "tue": 1, "2": 1, "utorak": 1,
+            "wednesday": 2, "wed": 2, "3": 2, "sreda": 2, "thursday": 3, "thu": 3, "4": 3, "cetvrtak": 3,
+            "friday": 4, "fri": 4, "5": 4, "petak": 4, "saturday": 5, "sat": 5, "6": 5, "subota": 5,
+            "sunday": 6, "sun": 6, "7": 6, "nedelja": 6}
+
+
+def retired_weekday(cfg):
+    name = cfg.get("schedule", "retired_weekday").strip().lower()
+    if name not in WEEKDAYS:
+        sys.exit("config.ini: [schedule] retired_weekday must be a weekday such as Monday (or a number 1-7, 1 = Monday).")
+    return WEEKDAYS[name]
+
+
 def is_due(player, entry, now, cfg):
     """Active players: inside the active window and active_every_hours after their last check.
     Inactive players: inside the inactive window and inactive_every_hours after their last check.
@@ -1056,10 +1069,12 @@ def is_due(player, entry, now, cfg):
     else:
         last = datetime.combine(date.fromisoformat(entry["checked"]), dtime(0, 0), tzinfo=TZ)
     sec = cfg["schedule"]
-    if player["state"] == "R":  # retired: once a month, from retired_day on, in the night window, after the I players
+    if player["state"] == "R":  # retired: once a week, from retired_weekday on, in the night window, after the I players
         if not in_time_window(now.time(), hhmm(sec["inactive_from"]), hhmm(sec["inactive_until"])):
             return False
-        return now.day >= int(sec["retired_day"]) and (last.year, last.month) < (now.year, now.month)
+        back = (now.weekday() - retired_weekday(cfg)) % 7  # days since the most recent retired_weekday (0 = today)
+        week_start = datetime.combine(now.date() - timedelta(days=back), dtime(0, 0), tzinfo=now.tzinfo)
+        return last < week_start  # not checked yet in this week (a missed night is made up at the next night window)
     kind = "active" if player["state"] == "A" else "inactive"
     if not in_time_window(now.time(), hhmm(sec[f"{kind}_from"]), hhmm(sec[f"{kind}_until"])):
         return False

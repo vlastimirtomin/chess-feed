@@ -1287,7 +1287,10 @@ def main():
                + recheck_candidates(data, now, recheck_days, give_up_days)) if results_on and not args.rebuild else []
     if details_on and not args.rebuild:
         waiting += [pr for pr in data.get("pairs", {}).values() if pr.get("join_pending")]
-    if not selected and not waiting and not args.rebuild:
+    deploy_pending = (state_dir / "deploy_pending").exists()  # the last publication failed (set by the workflow)
+    if deploy_pending:
+        print("The last publication of the feeds failed: they are published again in this run.")
+    if not selected and not waiting and not args.rebuild and not deploy_pending:
         print("Nothing to do now.")
         return
     if args.rebuild:
@@ -1584,6 +1587,11 @@ def main():
         if any(i["id"] not in before_ids for i in mine):
             new_files.add(fname)
     ping = [base + f for f in sorted(new_files)] if new_items else []
+    ping_file = state_dir / "ping_urls.txt"
+    if hub_list and ping_file.exists():  # pings of an earlier run that could not be sent yet stay on the list
+        ping = list(dict.fromkeys([l.strip() for l in ping_file.read_text(encoding="utf-8").splitlines() if l.strip()] + ping))
+    if not hub_list:
+        ping = []
 
     state_dir.mkdir(parents=True, exist_ok=True)
     write_state(state_dir / "data.json", data)
@@ -1594,7 +1602,7 @@ def main():
 
     print(f"Done: {ok} ok, {failures} failed, {len(new_items)} new feed items{', ABORTED' if aborted else ''}.")
     print("Feeds: " + ", ".join(f"{base}{g['file']}.xml" for g in groups.values()))
-    if aborted or (ok == 0 and not args.rebuild):
+    if aborted or (selected and ok == 0 and not args.rebuild):  # nothing to check is not a failure
         sys.exit(2)
 
 

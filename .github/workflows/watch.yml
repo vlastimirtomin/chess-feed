@@ -40,7 +40,7 @@ jobs:
       PYTHONUNBUFFERED: "1"   # show the script's progress lines in the log as they happen
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment2.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
 
@@ -101,10 +101,32 @@ jobs:
       - name: Publish the feeds
         id: deployment
         if: ${{ always() && steps.upload.outcome == 'success' }}
+        continue-on-error: true   # GitHub's publishing service sometimes fails for a moment: a second attempt follows
         uses: actions/deploy-pages@v5
 
+      - name: Wait before the second publication attempt
+        if: ${{ always() && steps.deployment.outcome == 'failure' }}
+        run: sleep 90
+
+      - name: Publish the feeds (second attempt)
+        id: deployment2
+        if: ${{ always() && steps.deployment.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - name: Remember whether the publication worked
+        if: ${{ always() && github.event.inputs.mode != 'discover' && github.event.inputs.mode != 'check-filter' && github.event.inputs.mode != 'check-results' && steps.upload.outcome != 'skipped' }}
+        run: |
+          # If it failed, the next run publishes again even when no player is due (see "deploy_pending" in the script).
+          if [ "${{ steps.deployment.outcome }}" = "success" ] || [ "${{ steps.deployment2.outcome }}" = "success" ]; then
+            rm -f data/state/deploy_pending
+          else
+            date -u +%Y-%m-%dT%H:%M:%SZ > data/state/deploy_pending
+            echo "::warning::The feeds could not be published; the next run will try again."
+          fi
+
       - name: Notify WebSub hubs
-        if: ${{ always() && steps.deployment.outcome == 'success' }}
+        if: ${{ always() && (steps.deployment.outcome == 'success' || steps.deployment2.outcome == 'success') }}
         run: python chess_watch.py --websub-ping --config data/config.ini --state-dir data/state --contact "https://github.com/${{ github.repository }}"
 
       - name: Save state and request log (private repository)
@@ -137,6 +159,12 @@ jobs:
           git add -A
           git commit -m "Squash history"
           git push --force origin "HEAD:${BRANCH}" || echo "::warning::Could not squash the history (is the branch protected?)"
+
+      - name: Report a failed publication
+        if: ${{ always() && steps.deployment.outcome == 'failure' && steps.deployment2.outcome == 'failure' }}
+        run: |
+          echo "::error::The feeds could not be published (two attempts). They stay as they were; the next run will try again."
+          exit 1
 
       - name: Keep scheduled runs alive
         if: ${{ always() }}
